@@ -1,30 +1,59 @@
 # Caption Generator Pro
 
-A simple Tkinter app for generating image captions with a LLaVA-style model.
+> A clean Tkinter desktop app for generating high-quality image captions with LLaVA-style vision-language models.
 
-## How to start
+## Preview
 
-1. Double-click `install.bat` once to install everything from `requirements.txt`.
-2. After that, double-click `startui.bat` to open the app.
+![Caption Generator Pro Screenshot](assets/Caption_Image_Generator.png)
 
-## What to fill in
+## Features
 
-- **Model name**: keep the default unless you want to use a different Hugging Face model.
-- **Hugging Face token (optional)**: fill this only if the model is private.
-- **Image path**: choose one image for single-image mode.
-- **Save path (optional)**: choose where to save the caption as `.txt` or `.json`.
-- **Prompt**: edit this if you want a different caption style.
-- **Output length**: lower values are faster; higher values produce longer captions.
-- **Extra generation values**: use these only if you want to fine-tune the result.
+- Single-image caption generation
+- Multi-image folder captioning for batch processing
+- Editable prompt box for custom caption style
+- Adjustable output length and generation settings
+- Optional Hugging Face token support for private models
+- Save captions as `.txt` or `.json`
+- Image preview and a responsive background UI
 
-## Single-image mode
+## Recommended Setup
+
+Before running the app, create a virtual environment and install the dependencies inside it.
+
+### Windows CMD
+
+```cmd
+cd "C:\Users\Admin\Desktop\Python\Data Science"
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+python code\caption_generator.py
+```
+
+### Windows PowerShell
+
+```powershell
+cd "C:\Users\Admin\Desktop\Python\Data Science"
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+python code\caption_generator.py
+```
+
+## Quick Start
+
+If you prefer the bundled launcher, you can still use `startui.bat` after setup. However, running `code/caption_generator.py` directly is fully supported and is often the faster option during development.
+
+## Usage
+
+### Single-image mode
 
 1. Leave **Enable multi-image folder mode** unchecked.
 2. Pick one image in **Image path**.
 3. Optionally choose a **Save path**.
 4. Click **Generate Caption**.
 
-## Multi-image mode
+### Multi-image mode
 
 1. Turn on **Enable multi-image folder mode**.
 2. Choose the folder that contains your images.
@@ -32,7 +61,7 @@ A simple Tkinter app for generating image captions with a LLaVA-style model.
 4. Optionally set a **Filename prefix**.
 5. Click **Generate Batch Captions**.
 
-## Notes
+## Tips
 
 - Shorter captions usually generate faster.
 - The app supports common image formats like PNG, JPG, JPEG, WEBP, BMP, TIF, and TIFF.

@@ -1,0 +1,32 @@
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local caches and model downloads
+.cache/
+cache/
+models/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
+
+# Generated outputs and local datasets
+outputs/
+captions/
+generated/
+*.caption.txt
+*.caption.json
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+
+# Windows/editor noise
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/

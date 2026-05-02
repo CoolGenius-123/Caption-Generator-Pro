@@ -9,6 +9,7 @@ import subprocess
 import threading
 import time
 import traceback
+from urllib.parse import unquote, urlparse
 from pathlib import Path
 from typing import Any
 
@@ -905,31 +906,61 @@ class QwenCaptionStudio:
             self._log("Drag and drop disabled. Install tkinterdnd2 to enable it.")
             return
 
-        targets = [self.root, self.preview_canvas]
-        if self.image_entry is not None:
-            targets.append(self.image_entry)
+        registered = 0
+        seen: set[str] = set()
+        targets = [self.root, *self._iter_widgets(self.root)]
 
         for target in targets:
+            widget_name = str(target)
+            if widget_name in seen:
+                continue
+            seen.add(widget_name)
             try:
                 target.drop_target_register(DND_FILES)
                 target.dnd_bind("<<Drop>>", self._handle_image_drop)
+                registered += 1
             except Exception as exc:
                 self._log(f"Could not enable drag and drop for {target}: {exc}")
 
+        if registered:
+            self._log(f"Drag and drop enabled on {registered} UI target(s).")
+
+    def _iter_widgets(self, widget: tk.Widget):
+        for child in widget.winfo_children():
+            yield child
+            yield from self._iter_widgets(child)
+
     def _handle_image_drop(self, event):
-        paths = self.root.tk.splitlist(event.data)
-        if not paths:
+        image_path = self._first_image_from_drop(event.data)
+        if image_path is None:
+            messagebox.showerror(
+                "Unsupported file",
+                "Drop a supported image file: PNG, JPG, JPEG, WEBP, BMP, TIF, or TIFF.",
+            )
             return
 
-        image_path = Path(paths[0].strip())
-        if not image_path.is_file() or image_path.suffix.lower() not in IMAGE_EXTENSIONS:
-            messagebox.showerror("Unsupported file", "Drop a supported image file: PNG, JPG, JPEG, WEBP, BMP, TIF, or TIFF.")
-            return
+        self._load_image_path(image_path, "drop")
 
-        self.image_path_var.set(str(image_path))
-        self._update_preview(str(image_path))
-        self.current_item_var.set(f"Current: {image_path.name}")
-        self._set_status(f"Image loaded from drop: {image_path.name}", self.good)
+    def _first_image_from_drop(self, data: str) -> Path | None:
+        try:
+            raw_paths = self.root.tk.splitlist(data)
+        except tk.TclError:
+            raw_paths = [data]
+
+        for raw_path in raw_paths:
+            image_path = self._normalize_dropped_path(raw_path)
+            if image_path.is_file() and image_path.suffix.lower() in IMAGE_EXTENSIONS:
+                return image_path
+        return None
+
+    def _normalize_dropped_path(self, raw_path: str) -> Path:
+        value = raw_path.strip().strip("{}").strip()
+        parsed = urlparse(value)
+        if parsed.scheme == "file":
+            value = unquote(parsed.path)
+            if os.name == "nt" and re.match(r"^/[A-Za-z]:/", value):
+                value = value[1:]
+        return Path(value)
 
     def _scale_block(self, parent: tk.Widget, label: str, variable, from_, to, resolution):
         block = tk.Frame(parent, bg=parent.cget("bg"))
@@ -976,9 +1007,16 @@ class QwenCaptionStudio:
             filetypes=[("Images", "*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff"), ("All files", "*.*")],
         )
         if path:
-            self.image_path_var.set(path)
-            self._update_preview(path)
-            self.current_item_var.set(f"Current: {Path(path).name}")
+            self._load_image_path(Path(path), "browse")
+
+    def _load_image_path(self, image_path: Path, source: str):
+        self.image_path_var.set(str(image_path))
+        self._update_preview(str(image_path))
+        self.current_item_var.set(f"Current: {image_path.name}")
+        if source == "drop":
+            self._set_status(f"Image loaded from drop: {image_path.name}", self.good)
+        else:
+            self._set_status(f"Image loaded: {image_path.name}", self.good)
 
     def choose_save_path(self):
         ext = ".json" if self.save_format_var.get() == "json" else ".txt"

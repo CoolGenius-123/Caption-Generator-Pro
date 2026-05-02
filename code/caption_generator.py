@@ -50,34 +50,54 @@ DEFAULT_ATTENTION_BACKEND = "flash_attention_2"
 DEFAULT_SPEED_PRESET = "Quality"
 
 SPEED_PRESETS = {
-    "Quality": {"max_new_tokens": 192, "max_image_side": 768, "thinking": False},
-    "Fast": {"max_new_tokens": 144, "max_image_side": 704, "thinking": False},
-    "Max Speed": {"max_new_tokens": 96, "max_image_side": 640, "thinking": False},
+    "Quality": {"max_new_tokens": 256, "max_image_side": 768, "thinking": False},
+    "Fast": {"max_new_tokens": 192, "max_image_side": 704, "thinking": False},
+    "Max Speed": {"max_new_tokens": 128, "max_image_side": 640, "thinking": False},
 }
 
 DEFAULT_SYSTEM_PROMPT = (
-    "You are a precise visual prompt writer for text-to-image models. "
-    "Convert the image into one rich, grounded, prompt-ready description. "
-    "Describe only what is visible or strongly implied by visual evidence. "
-    "Use concrete nouns, visual adjectives, and production-friendly phrasing. "
-    "Prioritize the main subject, composition, pose or action, setting, lighting, "
-    "color palette, materials, textures, mood, camera angle or viewpoint, depth, "
-    "and notable background details. Mention medium or style terms only when they "
-    "are visually evident, such as anime illustration, studio photo, watercolor, "
-    "3D render, cinematic lighting, macro shot, or flat graphic design. "
-    "Do not guess identities, names, exact locations, hidden intent, artist names, "
-    "copyrighted character names, or facts not shown in the image. "
-    "Do not add commentary about the image or the task."
+    "You are a professional visual prompt optimizer for text-to-image models, "
+    "including ERNIE-Image-Turbo. Convert the image into one high-quality, "
+    "generation-ready prompt that describes the final visible image only. "
+    "Preserve all visible hard constraints exactly: subject identity when clearly "
+    "known from visual evidence, object count, colors, positions, spatial "
+    "relationships, actions, camera framing, perspective, era, setting, style, "
+    "branding, proper nouns, numbers, labels, titles, and required visible text. "
+    "If text is visible in the image, preserve its spelling, capitalization, "
+    "punctuation, numbers, symbols, language, and line structure as accurately as "
+    "possible; do not paraphrase, translate, shorten, censor, or rewrite it. "
+    "Make every visible object and relationship explicit. Use concrete visual "
+    "details for subjects, pose, expression, interaction, foreground, midground, "
+    "background, lighting direction and quality, color palette, contrast, materials, "
+    "textures, camera angle, lens feel, crop, and composition. For posters, ads, "
+    "slides, infographics, packaging, documents, comics, storyboards, dashboards, "
+    "mobile UIs, desktop UIs, and other layout-sensitive images, describe a clean "
+    "drawable structure with hierarchy and placement: headline, subheadline, body "
+    "text blocks, CTA buttons, logos, panels, captions, sidebars, navigation, cards, "
+    "charts, footers, or screen regions when visible. For comics and storyboards, "
+    "describe panel order, shot type, character continuity, speech bubbles, captions, "
+    "and scene progression when visible. For realistic images, specify plausible "
+    "materials, lighting, lens feel, textures, and environmental cues. For "
+    "illustration or design work, specify style, shape language, rendering approach, "
+    "color treatment, and composition. Do not invent unsupported identities, hidden "
+    "intent, exact locations, artist names, copyrighted character names, or facts "
+    "not shown. Avoid meta phrasing, reasoning, safety commentary, negative prompts, "
+    "JSON, bullets, or explanations."
 )
 
 DEFAULT_USER_PROMPT = (
     "Write exactly one detailed natural-language prompt for a text-to-image model "
-    "based on this image. Aim for 80 to 140 words. Start with the main subject "
-    "and framing, then describe visible pose or action, facial expression if present, "
-    "clothing or objects, environment, lighting, colors, materials, textures, mood, "
-    "perspective, and background details. Make it vivid and useful for image generation "
-    "while staying faithful to the image. Return only the prompt text, with no title, "
-    "bullets, JSON, labels, explanations, or negative prompt."
+    "based on this image. Aim for 100 to 170 words, or shorter if the image is "
+    "simple. Start with the image type and main subject, then describe composition, "
+    "camera framing, pose or action, expression, clothing, objects, environment, "
+    "lighting, colors, materials, textures, style, mood, perspective, and background "
+    "details. If the image is a poster, comic, storyboard, UI, dashboard, packaging, "
+    "document, menu, slide, social post, or other structured design, explicitly "
+    "describe the visible layout hierarchy and element placement. If readable text "
+    "appears, quote it exactly and describe where it appears. Keep the prompt vivid, "
+    "precise, and generation-ready while staying faithful to the image. Return only "
+    "the prompt text, with no title, bullets, JSON, labels, explanations, or negative "
+    "prompt."
 )
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
@@ -841,7 +861,7 @@ class QwenCaptionStudio:
                 "• flash_attention_2 first, SDPA fallback\n"
                 "• thinking off for normal captioning\n"
                 "• max image side 768\n"
-                "• max new tokens 144 to 192\n"
+                "• max new tokens 192 to 256\n"
                 "• batch size 1"
             ),
             bg=self.panel,

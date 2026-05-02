@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import threading
 import time
 import traceback
@@ -17,15 +18,21 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 try:
-    from tkinterdnd2 import DND_FILES, TkinterDnD
+    from tkinterdnd2 import DND_FILES, DND_TEXT, TkinterDnD
 except Exception:
     DND_FILES = None
+    DND_TEXT = None
     TkinterDnD = None
 
 try:
     import psutil
 except Exception:
     psutil = None
+
+try:
+    import requests
+except Exception:
+    requests = None
 
 import torch
 from PIL import Image, ImageTk
@@ -82,7 +89,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "color treatment, and composition. Do not invent unsupported identities, hidden "
     "intent, exact locations, artist names, copyrighted character names, or facts "
     "not shown. Avoid meta phrasing, reasoning, safety commentary, negative prompts, "
-    "JSON, bullets, or explanations."
+    "JSON, bullets, explanations, or any thinking trace in the final response."
 )
 
 DEFAULT_USER_PROMPT = (
@@ -97,7 +104,7 @@ DEFAULT_USER_PROMPT = (
     "appears, quote it exactly and describe where it appears. Keep the prompt vivid, "
     "precise, and generation-ready while staying faithful to the image. Return only "
     "the prompt text, with no title, bullets, JSON, labels, explanations, or negative "
-    "prompt."
+    "prompt. Do not include reasoning, analysis, chain-of-thought, or thinking text."
 )
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
@@ -107,8 +114,28 @@ APP_TITLE = "Qwen Caption Studio"
 
 # -------- Utility helpers --------
 
-def strip_thinking_blocks(text: str) -> str:
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL)
+def extract_final_answer(text: str) -> str:
+    text = text.strip()
+    if not text:
+        return ""
+
+    closing_think = re.search(r"</think\s*>", text, flags=re.IGNORECASE)
+    if closing_think:
+        text = text[closing_think.end():]
+
+    text = re.sub(r"<think\b[^>]*>.*?</think\s*>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<think\b[^>]*>.*", "", text, flags=re.IGNORECASE | re.DOTALL)
+
+    final_markers = [
+        r"(?:^|\n)\s*(?:final answer|final output|answer|caption|prompt)\s*:\s*",
+        r"(?:^|\n)\s*(?:therefore|so),?\s+",
+    ]
+    for marker in final_markers:
+        parts = re.split(marker, text, maxsplit=1, flags=re.IGNORECASE)
+        if len(parts) == 2 and parts[1].strip():
+            text = parts[1]
+
+    text = re.sub(r"^\s*[-*\d.)\s]+", "", text.strip())
     return text.strip()
 
 
@@ -929,6 +956,9 @@ class QwenCaptionStudio:
         registered = 0
         seen: set[str] = set()
         targets = [self.root, *self._iter_widgets(self.root)]
+        drop_types = [DND_FILES]
+        if DND_TEXT is not None:
+            drop_types.append(DND_TEXT)
 
         for target in targets:
             widget_name = str(target)
@@ -936,7 +966,7 @@ class QwenCaptionStudio:
                 continue
             seen.add(widget_name)
             try:
-                target.drop_target_register(DND_FILES)
+                target.drop_target_register(*drop_types)
                 target.dnd_bind("<<Drop>>", self._handle_image_drop)
                 registered += 1
             except Exception as exc:
@@ -962,25 +992,102 @@ class QwenCaptionStudio:
         self._load_image_path(image_path, "drop")
 
     def _first_image_from_drop(self, data: str) -> Path | None:
-        try:
-            raw_paths = self.root.tk.splitlist(data)
-        except tk.TclError:
-            raw_paths = [data]
+        raw_paths = self._split_drop_data(data)
 
         for raw_path in raw_paths:
             image_path = self._normalize_dropped_path(raw_path)
             if image_path.is_file() and image_path.suffix.lower() in IMAGE_EXTENSIONS:
                 return image_path
+            if self._is_image_url(raw_path):
+                downloaded = self._download_dropped_image(raw_path)
+                if downloaded is not None:
+                    return downloaded
         return None
+
+    def _split_drop_data(self, data: str) -> list[str]:
+        stripped = data.strip()
+        if re.match(r"^(?:file|https?)://", stripped, flags=re.IGNORECASE) and "\n" not in stripped:
+            return [stripped]
+
+        try:
+            values = list(self.root.tk.splitlist(data))
+        except tk.TclError:
+            values = [data]
+
+        expanded: list[str] = []
+        for value in values:
+            value = value.strip()
+            if not value:
+                continue
+            if "\n" in value:
+                expanded.extend(part.strip() for part in value.splitlines() if part.strip())
+            else:
+                expanded.append(value)
+        return expanded
 
     def _normalize_dropped_path(self, raw_path: str) -> Path:
         value = raw_path.strip().strip("{}").strip()
         parsed = urlparse(value)
         if parsed.scheme == "file":
             value = unquote(parsed.path)
+            value = value.replace("\\", "/")
             if os.name == "nt" and re.match(r"^/[A-Za-z]:/", value):
                 value = value[1:]
         return Path(value)
+
+    def _is_image_url(self, value: str) -> bool:
+        value = value.strip().strip("{}").strip()
+        parsed = urlparse(value)
+        if parsed.scheme not in {"http", "https"}:
+            return False
+        suffix = Path(parsed.path).suffix.lower()
+        return suffix in IMAGE_EXTENSIONS or not suffix
+
+    def _download_dropped_image(self, url: str) -> Path | None:
+        if requests is None:
+            self._log("Dropped URL ignored because requests is not installed.")
+            return None
+
+        url = url.strip().strip("{}").strip()
+        try:
+            response = requests.get(url, timeout=15, stream=True)
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "").lower()
+            suffix = Path(urlparse(url).path).suffix.lower()
+            if suffix not in IMAGE_EXTENSIONS:
+                if "png" in content_type:
+                    suffix = ".png"
+                elif "webp" in content_type:
+                    suffix = ".webp"
+                elif "bmp" in content_type:
+                    suffix = ".bmp"
+                elif "tiff" in content_type or "tif" in content_type:
+                    suffix = ".tif"
+                elif "jpeg" in content_type or "jpg" in content_type or "image/" in content_type:
+                    suffix = ".jpg"
+                else:
+                    self._log(f"Dropped URL is not an image: {content_type or url}")
+                    return None
+
+            drop_dir = Path(tempfile.gettempdir()) / "qwen_caption_studio_drops"
+            drop_dir.mkdir(parents=True, exist_ok=True)
+            path = drop_dir / f"dropped_{int(time.time() * 1000)}{suffix}"
+            with path.open("wb") as f:
+                for chunk in response.iter_content(chunk_size=1024 * 256):
+                    if chunk:
+                        f.write(chunk)
+
+            try:
+                Image.open(path).verify()
+            except Exception:
+                path.unlink(missing_ok=True)
+                self._log(f"Downloaded dropped URL but it was not a valid image: {url}")
+                return None
+
+            return path
+        except Exception as exc:
+            self._log(f"Could not download dropped image URL: {type(exc).__name__}: {exc}")
+            return None
 
     def _scale_block(self, parent: tk.Widget, label: str, variable, from_, to, resolution):
         block = tk.Frame(parent, bg=parent.cget("bg"))
@@ -1662,7 +1769,7 @@ class QwenCaptionStudio:
             clean_up_tokenization_spaces=False,
         )[0].strip()
 
-        caption = strip_thinking_blocks(caption)
+        caption = extract_final_answer(caption)
         caption = re.sub(r"\s+", " ", caption).strip()
 
         if not caption:

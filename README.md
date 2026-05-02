@@ -1,6 +1,12 @@
-# Caption Generator Pro
+# Qwen Caption Studio
 
-> A clean Tkinter desktop app for generating high-quality image captions with LLaVA-style vision-language models.
+> A local Tkinter desktop app for generating prompt-ready image captions with a Qwen3.5 2B 4-bit vision-language model.
+
+Target model:
+
+```text
+techwithsergiu/Qwen3.5-2B-bnb-4bit
+```
 
 ## Preview
 
@@ -9,60 +15,81 @@
 ## Features
 
 - Single-image caption generation
-- Multi-image folder captioning for batch processing
-- Editable prompt box for custom caption style
-- Adjustable output length and generation settings
-- Optional Hugging Face token support for private models
+- Folder batch captioning with stop-after-current-image behavior
+- Qwen chat-template based vision-language inference
+- Enhanced text-to-image prompt defaults with editable system and user prompts
+- Drag-and-drop image loading with Browse fallback
+- Speed presets, model prewarm, and FlashAttention-first loading with SDPA fallback
+- Optional thinking mode control
+- Optional image resizing before inference for lower GPU memory usage
 - Save captions as `.txt` or `.json`
-- Image preview and a responsive background UI
+- Batch resume behavior by skipping output files that already exist
+- Live RAM, CPU, GPU, temperature, timer, and progress status
+- Background worker threads to keep the UI responsive
 
 ## Recommended Setup
 
-Before running the app, create a virtual environment and install the dependencies inside it.
+Create a virtual environment first. Install PyTorch with CUDA from the official PyTorch selector for your GPU and driver, then install the app dependencies.
 
 ### Windows CMD
 
 ```cmd
-cd "C:\Users\Admin\Desktop\Python\Data Science"
+cd "<repo path>\Caption-Generator-Pro"
 python -m venv .venv
 .venv\Scripts\activate
-pip install -r requirements.txt
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 python code\caption_generator.py
 ```
 
 ### Windows PowerShell
 
 ```powershell
-cd "C:\Users\Admin\Desktop\Python\Data Science"
+cd "<repo path>\Caption-Generator-Pro"
 python -m venv .venv
 .venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 python code\caption_generator.py
 ```
 
 ## Quick Start
 
-If you prefer the bundled launcher, you can still use `startui.bat` after setup. However, running `code/caption_generator.py` directly is fully supported and is often the faster option during development.
+After setup, run `startui.bat` or launch the app directly:
+
+```cmd
+python code\caption_generator.py
+```
+
+## Performance Options
+
+- **Speed preset** controls token budget and image resize limits for quality/speed tradeoffs.
+- **Attention backend** defaults to FlashAttention 2 when compatible and falls back to SDPA if unavailable.
+- **Prewarm after model load** runs a tiny warmup pass to reduce first-generation latency.
 
 ## Usage
 
 ### Single-image mode
 
-1. Leave **Enable multi-image folder mode** unchecked.
-2. Pick one image in **Image path**.
-3. Optionally choose a **Save path**.
-4. Click **Generate Caption**.
+1. Leave **Batch mode** unchecked.
+2. Drop an image onto the app or use **Browse** to pick one image file.
+3. Edit the system or user prompt if needed.
+4. Optionally choose a save path.
+5. Click **Generate**.
 
-### Multi-image mode
+### Batch mode
 
-1. Turn on **Enable multi-image folder mode**.
+1. Turn on **Batch mode**.
 2. Choose the folder that contains your images.
-3. Choose a folder where the captions should be saved.
-4. Optionally set a **Filename prefix**.
-5. Click **Generate Batch Captions**.
+3. Choose a folder where captions should be saved.
+4. Optionally set a filename prefix.
+5. Click **Generate**.
 
-## Tips
+Batch jobs skip image outputs that already exist when **Skip existing output files** is enabled.
 
-- Shorter captions usually generate faster.
-- The app supports common image formats like PNG, JPG, JPEG, WEBP, BMP, TIF, and TIFF.
-- If you do not enter a save path, the caption will only show in the app.
+## Notes
+
+- The first run may download model files from Hugging Face.
+- Use a Hugging Face token in the UI if the model or cache access requires it.
+- On memory-limited GPUs, keep image resizing enabled and close other GPU-heavy apps before loading the model.
+- The app supports PNG, JPG, JPEG, WEBP, BMP, TIF, and TIFF images.

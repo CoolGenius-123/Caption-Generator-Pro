@@ -1,147 +1,376 @@
-"""
-Tkinter image caption generator for LLaVA-style models.
-
-Features:
-- model name input
-- output length slider
-- extra generation controls
-- image path picker
-- optional save path for .txt or .json
-- editable prompt box
-- responsive UI with background generation
-"""
-
 from __future__ import annotations
 
+import gc
+import importlib.util
 import json
-import hashlib
+import os
 import re
+import subprocess
+import tempfile
 import threading
 import time
-import subprocess
 import traceback
+from urllib.parse import unquote, urlparse
 from pathlib import Path
-from typing import Any, cast
-from tkinter import BOTH, END, LEFT, RIGHT, TOP, X, Y, filedialog, messagebox, scrolledtext, ttk
+from typing import Any
+
 import tkinter as tk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
+
+try:
+    from tkinterdnd2 import DND_FILES, DND_TEXT, TkinterDnD
+except Exception:
+    DND_FILES = None
+    DND_TEXT = None
+    TkinterDnD = None
 
 try:
     import psutil
 except Exception:
     psutil = None
 
+try:
+    import requests
+except Exception:
+    requests = None
+
 import torch
 from PIL import Image, ImageTk
-from transformers import AutoProcessor, LlavaForConditionalGeneration, StoppingCriteria, StoppingCriteriaList
 
-
-DEFAULT_MODEL_NAME = "fancyfeast/llama-joycaption-beta-one-hf-llava"
-DEFAULT_PROMPT = (
-    "Write a detailed descriptive caption for this image in a clear, natural, "
-    "and formal tone. Mention the main subject, colors, setting, mood, and "
-    "notable details."
+from transformers import (
+    AutoProcessor,
+    StoppingCriteria,
+    StoppingCriteriaList,
 )
-DEFAULT_IMAGE_HINT = "Choose an image file..."
-DEFAULT_SAVE_HINT = "Optional: choose where to save the caption..."
-DEFAULT_CAPTION_PREFIX_HINT = "Optional: add a prefix or ending phrase..."
+
+# Optional but strongly recommended for Qwen VL workflows
+try:
+    from qwen_vl_utils import process_vision_info
+except Exception:
+    process_vision_info = None
 
 
-class PlaceholderEntry(tk.Entry):
-    def __init__(self, master, placeholder: str, placeholder_fg: str, text_fg: str, **kwargs):
-        super().__init__(master, **kwargs)
-        self.placeholder = placeholder
-        self.placeholder_fg = placeholder_fg
-        self.text_fg = text_fg
-        self._has_placeholder = False
-        self.bind("<FocusIn>", self._clear_placeholder)
-        self.bind("<FocusOut>", self._restore_placeholder)
-        self._restore_placeholder()
+# -------- Model defaults --------
 
-    def _clear_placeholder(self, _event=None):
-        if self._has_placeholder:
-            self.delete(0, END)
-            self.config(fg=self.text_fg)
-            self._has_placeholder = False
+DEFAULT_MODEL_NAME = "techwithsergiu/Qwen3.5-2B-bnb-4bit"
+DEFAULT_ATTENTION_BACKEND = "flash_attention_2"
+DEFAULT_SPEED_PRESET = "Quality"
 
-    def _restore_placeholder(self, _event=None):
-        if not self.get().strip():
-            self.delete(0, END)
-            self.insert(0, self.placeholder)
-            self.config(fg=self.placeholder_fg)
-            self._has_placeholder = True
+SPEED_PRESETS = {
+    "Quality": {"max_new_tokens": 256, "max_image_side": 768, "thinking": False},
+    "Fast": {"max_new_tokens": 192, "max_image_side": 704, "thinking": False},
+    "Max Speed": {"max_new_tokens": 128, "max_image_side": 640, "thinking": False},
+}
 
-    def get_value(self) -> str:
-        if self._has_placeholder:
-            return ""
-        return self.get().strip()
+DEFAULT_SYSTEM_PROMPT = (
+    "You are a professional visual prompt optimizer for text-to-image models, "
+    "including ERNIE-Image-Turbo. Convert the image into one high-quality, "
+    "generation-ready prompt that describes the final visible image only. "
+    "Preserve all visible hard constraints exactly: subject identity when clearly "
+    "known from visual evidence, object count, colors, positions, spatial "
+    "relationships, actions, camera framing, perspective, era, setting, style, "
+    "branding, proper nouns, numbers, labels, titles, and required visible text. "
+    "If text is visible in the image, preserve its spelling, capitalization, "
+    "punctuation, numbers, symbols, language, and line structure as accurately as "
+    "possible; do not paraphrase, translate, shorten, censor, or rewrite it. "
+    "Make every visible object and relationship explicit. Use concrete visual "
+    "details for subjects, pose, expression, interaction, foreground, midground, "
+    "background, lighting direction and quality, color palette, contrast, materials, "
+    "textures, camera angle, lens feel, crop, and composition. For posters, ads, "
+    "slides, infographics, packaging, documents, comics, storyboards, dashboards, "
+    "mobile UIs, desktop UIs, and other layout-sensitive images, describe a clean "
+    "drawable structure with hierarchy and placement: headline, subheadline, body "
+    "text blocks, CTA buttons, logos, panels, captions, sidebars, navigation, cards, "
+    "charts, footers, or screen regions when visible. For comics and storyboards, "
+    "describe panel order, shot type, character continuity, speech bubbles, captions, "
+    "and scene progression when visible. For realistic images, specify plausible "
+    "materials, lighting, lens feel, textures, and environmental cues. For "
+    "illustration or design work, specify style, shape language, rendering approach, "
+    "color treatment, and composition. Do not invent unsupported identities, hidden "
+    "intent, exact locations, artist names, copyrighted character names, or facts "
+    "not shown. Avoid meta phrasing, reasoning, safety commentary, negative prompts, "
+    "JSON, bullets, explanations, or any thinking trace in the final response."
+)
+
+DEFAULT_USER_PROMPT = (
+    "Write exactly one detailed natural-language prompt for a text-to-image model "
+    "based on this image. Aim for 100 to 170 words, or shorter if the image is "
+    "simple. Start with the image type and main subject, then describe composition, "
+    "camera framing, pose or action, expression, clothing, objects, environment, "
+    "lighting, colors, materials, textures, style, mood, perspective, and background "
+    "details. If the image is a poster, comic, storyboard, UI, dashboard, packaging, "
+    "document, menu, slide, social post, or other structured design, explicitly "
+    "describe the visible layout hierarchy and element placement. If readable text "
+    "appears, quote it exactly and describe where it appears. Keep the prompt vivid, "
+    "precise, and generation-ready while staying faithful to the image. Return only "
+    "the prompt text, with no title, bullets, JSON, labels, explanations, or negative "
+    "prompt. Do not include reasoning, analysis, chain-of-thought, or thinking text."
+)
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+
+APP_TITLE = "Qwen Caption Studio"
+
+
+# -------- Utility helpers --------
+
+def extract_final_answer(text: str) -> str:
+    text = text.strip()
+    if not text:
+        return ""
+
+    closing_think = re.search(r"</think\s*>", text, flags=re.IGNORECASE)
+    if closing_think:
+        text = text[closing_think.end():]
+
+    text = re.sub(r"<think\b[^>]*>.*?</think\s*>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<think\b[^>]*>.*", "", text, flags=re.IGNORECASE | re.DOTALL)
+
+    final_markers = [
+        r"(?:^|\n)\s*(?:final answer|final output|answer|caption|prompt)\s*:\s*",
+        r"(?:^|\n)\s*(?:therefore|so),?\s+",
+    ]
+    for marker in final_markers:
+        parts = re.split(marker, text, maxsplit=1, flags=re.IGNORECASE)
+        if len(parts) == 2 and parts[1].strip():
+            text = parts[1]
+
+    text = re.sub(r"^\s*[-*\d.)\s]+", "", text.strip())
+    return text.strip()
+
+
+def sanitize_filename(name: str) -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*]+', "_", name.strip())
+    cleaned = cleaned.replace(" ", "_")
+    return cleaned.strip("._ ") or "caption"
+
+
+def format_seconds(seconds: float) -> str:
+    total = max(0, int(seconds))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def resize_image_for_vram(image: Image.Image, max_side: int) -> Image.Image:
+    image = image.convert("RGB")
+    w, h = image.size
+    if max(w, h) <= max_side:
+        return image
+    scale = max_side / float(max(w, h))
+    new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+    return image.resize(new_size, Image.LANCZOS)
+
+
+def pick_torch_dtype() -> torch.dtype:
+    if torch.cuda.is_available():
+        try:
+            if torch.cuda.is_bf16_supported():
+                return torch.bfloat16
+        except Exception:
+            pass
+        return torch.float16
+    return torch.float32
+
+
+def get_cpu_ram_text() -> str:
+    if psutil is None:
+        return "RAM: N/A"
+    vm = psutil.virtual_memory()
+    return f"RAM: {vm.percent:.0f}%"
+
+
+def get_cpu_text() -> str:
+    if psutil is None:
+        return "CPU: N/A"
+    return f"CPU: {psutil.cpu_percent(interval=None):.0f}%"
+
+
+def get_cpu_temp_text() -> str:
+    if psutil is None:
+        return "CPU TEMP: N/A"
+    sensors_temperatures = getattr(psutil, "sensors_temperatures", None)
+    if callable(sensors_temperatures):
+        try:
+            temps = sensors_temperatures(fahrenheit=False)
+            for entries in temps.values():
+                for entry in entries:
+                    if getattr(entry, "current", None) is not None:
+                        return f"CPU TEMP: {entry.current:.0f}°C"
+        except Exception:
+            pass
+    return "CPU TEMP: N/A"
+
+
+def run_nvidia_smi(query: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        value = result.stdout.strip().splitlines()[0].strip()
+        return value
+    except Exception:
+        return None
+
+
+def get_gpu_text() -> str:
+    if not torch.cuda.is_available():
+        return "GPU: N/A"
+    util = run_nvidia_smi("utilization.gpu")
+    if util:
+        return f"GPU: {util}%"
+    try:
+        return f"GPU: {torch.cuda.get_device_name(0)}"
+    except Exception:
+        return "GPU: CUDA"
+
+
+def get_gpu_temp_text() -> str:
+    if not torch.cuda.is_available():
+        return "GPU TEMP: N/A"
+    temp = run_nvidia_smi("temperature.gpu")
+    return f"GPU TEMP: {temp}°C" if temp else "GPU TEMP: N/A"
+
+
+def get_model_loader_class():
+    """
+    Try the most direct class first.
+    Fall back to auto classes if the exact class is unavailable.
+    """
+    try:
+        from transformers import Qwen3_5ForConditionalGeneration
+        return Qwen3_5ForConditionalGeneration
+    except Exception:
+        pass
+
+    try:
+        from transformers import AutoModelForImageTextToText
+        return AutoModelForImageTextToText
+    except Exception:
+        pass
+
+    try:
+        from transformers import AutoModelForVision2Seq
+        return AutoModelForVision2Seq
+    except Exception:
+        pass
+
+    try:
+        from transformers import AutoModelForCausalLM
+        return AutoModelForCausalLM
+    except Exception:
+        pass
+
+    raise ImportError(
+        "Could not find a suitable Transformers model loader for Qwen3.5 multimodal. "
+        "Please upgrade transformers."
+    )
+
+
 class StopGenerationCriteria(StoppingCriteria):
     def __init__(self, stop_event: threading.Event):
-        super().__init__()
         self.stop_event = stop_event
+        super().__init__()
 
-    def __call__(self, input_ids, scores, **kwargs) -> torch.BoolTensor:
-        return cast(torch.BoolTensor, torch.tensor([self.stop_event.is_set()], device=input_ids.device, dtype=torch.bool))
+    def __call__(self, input_ids, scores, **kwargs):
+        return torch.tensor(
+            [self.stop_event.is_set()],
+            device=input_ids.device,
+            dtype=torch.bool,
+        )
 
 
-class CaptionGeneratorApp:
+# -------- Main App --------
+
+class QwenCaptionStudio:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Caption Generator Pro")
-        self.root.geometry("1140x820")
-        self.root.minsize(1020, 760)
-        self.root.configure(bg="#0f172a")
+        self.root.title(APP_TITLE)
+        self.root.geometry("1360x900")
+        self.root.minsize(1180, 820)
+        self.root.configure(bg="#0b1220")
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        self.model_cache: dict[tuple[str, str], tuple[Any, Any, str]] = {}
-        self.current_worker: threading.Thread | None = None
-        self.preview_photo: ImageTk.PhotoImage | None = None
-        self.brand_icon_photo: ImageTk.PhotoImage | None = None
-        self.preview_image_id: int | None = None
-        self.debug_visible = tk.BooleanVar(value=False)
-        self.batch_mode_var = tk.BooleanVar(value=False)
+        self.worker: threading.Thread | None = None
         self.stop_requested = threading.Event()
-        self.active_scroll_canvas: tk.Canvas | None = None
 
-        self.caption_timer_var = tk.StringVar(value="⏱ Idle | Last Image Took: --:--:--")
-        self.ram_var = tk.StringVar(value="RAM: --")
+        self.processor: Any | None = None
+        self.model: Any | None = None
+        self.loaded_model_name: str | None = None
+        self.loaded_device: str | None = None
+        self.loaded_dtype: torch.dtype | None = None
+        self.loaded_attn_backend: str | None = None
+
+        self.preview_photo: ImageTk.PhotoImage | None = None
+        self.image_entry: tk.Entry | None = None
+        self.timer_running = False
+        self.timer_start = 0.0
+        self.timer_job: str | None = None
+        self.last_elapsed = "--:--:--"
+
+        self._make_variables()
+        self._build_styles()
+        self._build_ui()
+        self._setup_drag_drop()
+        self._update_system_info()
+        self._set_status("Ready. Load the model or pick an image and generate a caption.")
+
+    # ---------- Variables ----------
+
+    def _make_variables(self):
+        self.model_name_var = tk.StringVar(value=DEFAULT_MODEL_NAME)
+        self.hf_token_var = tk.StringVar(value="")
+        self.image_path_var = tk.StringVar(value="")
+        self.save_path_var = tk.StringVar(value="")
+        self.save_format_var = tk.StringVar(value="txt")
+
+        self.batch_mode_var = tk.BooleanVar(value=False)
+        self.batch_folder_var = tk.StringVar(value="")
+        self.batch_save_folder_var = tk.StringVar(value="")
+        self.batch_prefix_var = tk.StringVar(value="")
+        self.skip_existing_var = tk.BooleanVar(value=True)
+
+        self.speed_preset_var = tk.StringVar(value=DEFAULT_SPEED_PRESET)
+        self.prewarm_var = tk.BooleanVar(value=True)
+        self.enable_thinking_var = tk.BooleanVar(value=False)
+        self.max_new_tokens_var = tk.IntVar(value=SPEED_PRESETS[DEFAULT_SPEED_PRESET]["max_new_tokens"])
+        self.max_image_side_var = tk.IntVar(value=SPEED_PRESETS[DEFAULT_SPEED_PRESET]["max_image_side"])
+
+        self.do_sample_var = tk.BooleanVar(value=False)
+        self.temperature_var = tk.DoubleVar(value=0.3)
+        self.top_p_var = tk.DoubleVar(value=0.9)
+        self.top_k_var = tk.IntVar(value=40)
+        self.repetition_penalty_var = tk.DoubleVar(value=1.05)
+        self.attn_backend_var = tk.StringVar(value=DEFAULT_ATTENTION_BACKEND)
+
         self.cpu_var = tk.StringVar(value="CPU: --")
+        self.ram_var = tk.StringVar(value="RAM: --")
         self.gpu_var = tk.StringVar(value="GPU: --")
         self.cpu_temp_var = tk.StringVar(value="CPU TEMP: --")
         self.gpu_temp_var = tk.StringVar(value="GPU TEMP: --")
-        self.caption_timer_running = False
-        self.caption_timer_start = 0.0
-        self.caption_timer_job: str | None = None
-        self.last_caption_elapsed: str = "--:--:--"
+        self.timer_var = tk.StringVar(value="Elapsed: --:--:--")
+        self.current_item_var = tk.StringVar(value="Current: none")
+        self.model_state_var = tk.StringVar(value="Model: not loaded")
         self.batch_progress_var = tk.StringVar(value="")
-        self.current_image_var = tk.StringVar(value="Current image: none selected")
+        self.prompt_detail_var = tk.StringVar(value="")
 
-        self._apply_window_icon()
-        self._build_styles()
-        self._build_layout()
-        self._update_system_info()
-        self._set_status("Ready. Pick an image and press Generate.")
-
-    def _icon_path(self) -> Path:
-        return Path(__file__).resolve().parent.parent / "assets" / "logo.ico"
-
-    def _apply_window_icon(self):
-        icon_path = self._icon_path()
-        if icon_path.exists():
-            try:
-                self.root.iconbitmap(default=str(icon_path))
-            except Exception:
-                pass
+    # ---------- UI ----------
 
     def _build_styles(self):
-        self.bg = "#0f172a"
-        self.panel = "#162033"
-        self.panel_alt = "#1c2840"
-        self.accent = "#38bdf8"
-        self.accent2 = "#f59e0b"
-        self.text = "#e5eefb"
-        self.muted = "#93a4bf"
-        self.border = "#2d3a57"
-        self.good = "#22c55e"
-        self.error = "#ef4444"
+        self.bg = "#0b1220"
+        self.panel = "#101a2d"
+        self.panel_alt = "#13213a"
+        self.card = "#16243f"
+        self.border = "#253655"
+        self.text = "#e5edf8"
+        self.muted = "#9fb1ca"
+        self.accent = "#59c3ff"
+        self.good = "#34d399"
+        self.warn = "#fbbf24"
+        self.bad = "#f87171"
 
         style = ttk.Style()
         try:
@@ -151,1439 +380,1429 @@ class CaptionGeneratorApp:
 
         style.configure("TFrame", background=self.bg)
         style.configure("Card.TFrame", background=self.panel)
-        style.configure("CardAlt.TFrame", background=self.panel_alt)
         style.configure("TLabel", background=self.bg, foreground=self.text, font=("Segoe UI", 10))
+        style.configure("Muted.TLabel", background=self.bg, foreground=self.muted, font=("Segoe UI", 10))
         style.configure("Title.TLabel", background=self.bg, foreground=self.text, font=("Segoe UI", 22, "bold"))
-        style.configure("SubTitle.TLabel", background=self.bg, foreground=self.muted, font=("Segoe UI", 10))
         style.configure("Section.TLabel", background=self.panel, foreground=self.text, font=("Segoe UI", 11, "bold"))
-        style.configure("TCheckbutton", background=self.panel, foreground=self.text, font=("Segoe UI", 10))
-        style.map("TCheckbutton", background=[("active", self.panel)])
+        style.configure("TNotebook", background=self.bg, borderwidth=0)
+        style.configure("TNotebook.Tab", font=("Segoe UI", 10), padding=(10, 6))
+        style.configure("TCombobox", padding=5)
+        style.configure("TCheckbutton", background=self.panel, foreground=self.text)
+
         style.configure(
-            "Accent.TButton",
+            "Primary.TButton",
             background=self.accent,
-            foreground="#08111f",
+            foreground="#08121f",
             font=("Segoe UI", 10, "bold"),
-            padding=(14, 10),
+            padding=(12, 8),
         )
-        style.map(
-            "Accent.TButton",
-            background=[("active", "#7dd3fc"), ("disabled", "#35516b")],
-            foreground=[("disabled", "#9bb0c5")],
-        )
+        style.map("Primary.TButton", background=[("active", "#8bd8ff"), ("disabled", "#36546e")])
+
         style.configure(
             "Soft.TButton",
-            background="#24324d",
+            background="#253655",
             foreground=self.text,
             font=("Segoe UI", 10),
-            padding=(12, 8),
+            padding=(10, 8),
         )
-        style.map("Soft.TButton", background=[("active", "#334160")])
+        style.map("Soft.TButton", background=[("active", "#34486d")])
+
         style.configure(
             "Danger.TButton",
-            background="#ef4444",
+            background="#dc2626",
             foreground="#ffffff",
             font=("Segoe UI", 10, "bold"),
-            padding=(12, 8),
+            padding=(10, 8),
         )
-        style.map("Danger.TButton", background=[("active", "#f87171"), ("disabled", "#7f1d1d")])
-        style.configure(
-            "TCombobox",
-            fieldbackground="#12203a",
-            background="#12203a",
-            foreground=self.text,
-            arrowsize=14,
-            padding=6,
-        )
+        style.map("Danger.TButton", background=[("active", "#ef4444"), ("disabled", "#692020")])
 
-    def _build_layout(self):
-        header = ttk.Frame(self.root, style="TFrame")
-        header.pack(fill=X, padx=20, pady=(18, 8))
+    def _build_ui(self):
+        self._build_header()
 
-        title_row = tk.Frame(header, bg=self.bg)
-        title_row.pack(fill=X)
+        body = ttk.Panedwindow(self.root, orient="horizontal")
+        body.pack(fill="both", expand=True, padx=16, pady=(0, 14))
+
+        left = tk.Frame(body, bg=self.bg, width=460)
+        right = tk.Frame(body, bg=self.bg)
+
+        body.add(left, weight=0)
+        body.add(right, weight=1)
+
+        self._build_left_panel(left)
+        self._build_right_panel(right)
+
+    def _build_header(self):
+        header = tk.Frame(self.root, bg=self.bg)
+        header.pack(fill="x", padx=16, pady=(14, 10))
 
         tk.Label(
-            title_row,
-            text="Caption Generator Pro",
+            header,
+            text=APP_TITLE,
             bg=self.bg,
             fg=self.text,
             font=("Segoe UI", 22, "bold"),
-        ).pack(anchor="center")
+        ).pack(anchor="w")
+
         tk.Label(
-            title_row,
-            text="Fast local image captioning with a clean GUI for models, prompts, and save options.",
+            header,
+            text="Clean local image captioning with Qwen3.5 2B 4-bit, system prompts, thinking control, and batch export.",
             bg=self.bg,
             fg=self.muted,
             font=("Segoe UI", 10),
-        ).pack(anchor="center", pady=(4, 0))
+        ).pack(anchor="w", pady=(2, 10))
 
-        self._build_top_nav()
+        chips = tk.Frame(header, bg=self.bg)
+        chips.pack(fill="x")
 
-        body = ttk.Frame(self.root, style="TFrame")
-        body.pack(fill=BOTH, expand=True, padx=20, pady=12)
+        for var in [self.cpu_var, self.ram_var, self.gpu_var, self.cpu_temp_var, self.gpu_temp_var, self.timer_var]:
+            self._make_chip(chips, var)
 
-        left = tk.Frame(body, bg=self.bg)
-        left.pack(side=LEFT, fill=Y, expand=False)
-
-        left_canvas = tk.Canvas(left, bg=self.bg, highlightthickness=0, bd=0, width=390)
-        left_scrollbar = ttk.Scrollbar(left, orient="vertical", command=left_canvas.yview)
-        left_scrollable = tk.Frame(left_canvas, bg=self.bg)
-
-        left_scrollable.bind(
-            "<Configure>",
-            lambda _event: left_canvas.configure(scrollregion=left_canvas.bbox("all")),
-        )
-        left_canvas_window = left_canvas.create_window((0, 0), window=left_scrollable, anchor="nw")
-        left_canvas.configure(yscrollcommand=left_scrollbar.set)
-
-        left_canvas.pack(side=LEFT, fill=Y, expand=False)
-        left_scrollbar.pack(side=RIGHT, fill=Y)
-
-        def _sync_canvas_width(event):
-            left_canvas.itemconfigure(left_canvas_window, width=event.width)
-
-        left_canvas.bind("<Configure>", _sync_canvas_width)
-        left_canvas.bind("<Enter>", lambda _event, canvas=left_canvas: self._set_active_scroll_canvas(canvas))
-
-        right = tk.Frame(body, bg=self.bg)
-        right.pack(side=RIGHT, fill=BOTH, expand=True, padx=(16, 0))
-
-        right_canvas = tk.Canvas(right, bg=self.bg, highlightthickness=0, bd=0)
-        right_scrollbar = ttk.Scrollbar(right, orient="vertical", command=right_canvas.yview)
-        right_scrollable = tk.Frame(right_canvas, bg=self.bg)
-
-        right_scrollable.bind(
-            "<Configure>",
-            lambda _event: right_canvas.configure(scrollregion=right_canvas.bbox("all")),
-        )
-        right_canvas_window = right_canvas.create_window((0, 0), window=right_scrollable, anchor="nw")
-        right_canvas.configure(yscrollcommand=right_scrollbar.set)
-
-        right_canvas.pack(side=LEFT, fill=BOTH, expand=True)
-        right_scrollbar.pack(side=RIGHT, fill=Y)
-
-        def _sync_right_canvas_width(event):
-            right_canvas.itemconfigure(right_canvas_window, width=event.width)
-
-        right_canvas.bind("<Configure>", _sync_right_canvas_width)
-        right_canvas.bind("<Enter>", lambda _event, canvas=right_canvas: self._set_active_scroll_canvas(canvas))
-
-        self.root.bind_all("<MouseWheel>", self._on_mousewheel_global, add="+")
-
-        self._build_settings_panel(left_scrollable)
-        self._build_output_panel(right_scrollable)
-        self._build_footer()
-
-    def _build_top_nav(self):
-        nav = tk.Frame(self.root, bg="#0b1220", highlightbackground=self.border, highlightthickness=1)
-        nav.pack(fill=X, padx=20, pady=(0, 8))
-
-        left = tk.Frame(nav, bg="#0b1220")
-        left.pack(side=LEFT, padx=14, pady=10)
-        tk.Label(left, text="📡 Live Monitor", bg="#0b1220", fg=self.text, font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        tk.Label(left, text="System status updates in real time while you caption.", bg="#0b1220", fg=self.muted, font=("Segoe UI", 9)).pack(anchor="w")
-
-        right = tk.Frame(nav, bg="#0b1220")
-        right.pack(side=RIGHT, padx=14, pady=10)
-
-        info_row = tk.Frame(right, bg="#0b1220")
-        info_row.pack(anchor="e")
-
-        self._make_info_chip(info_row, "RAM", self.ram_var)
-        self._make_info_chip(info_row, "CPU", self.cpu_var)
-        self._make_info_chip(info_row, "GPU", self.gpu_var)
-        self._make_info_chip(info_row, "CPU TEMP", self.cpu_temp_var)
-        self._make_info_chip(info_row, "GPU TEMP", self.gpu_temp_var)
-
-        clock_box = tk.Frame(right, bg="#132033", highlightbackground=self.border, highlightthickness=1)
-        clock_box.pack(anchor="e", pady=(8, 0), fill=X)
-        timer_row = tk.Frame(clock_box, bg="#132033")
-        timer_row.pack(fill=X)
-        tk.Label(timer_row, text="⏱", bg="#132033", fg=self.accent, font=("Segoe UI", 12)).pack(side=LEFT, padx=(10, 6), pady=(6, 2))
-        tk.Label(timer_row, textvariable=self.caption_timer_var, bg="#132033", fg=self.text, font=("Segoe UI", 12, "bold")).pack(side=LEFT, padx=(0, 10), pady=(6, 2))
-        tk.Label(clock_box, textvariable=self.batch_progress_var, bg="#132033", fg=self.muted, font=("Segoe UI", 9)).pack(anchor="w", padx=10, pady=(0, 6))
-        tk.Label(clock_box, textvariable=self.current_image_var, bg="#132033", fg=self.muted, font=("Segoe UI", 9)).pack(anchor="w", padx=10, pady=(0, 6))
-
-    def _make_info_chip(self, parent: tk.Widget, title: str, value_var: tk.StringVar):
-        chip = tk.Frame(parent, bg="#132033", highlightbackground=self.border, highlightthickness=1)
-        chip.pack(side=LEFT, padx=(0, 8))
-        tk.Label(chip, text=title, bg="#132033", fg=self.muted, font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=8, pady=(5, 0))
-        tk.Label(chip, textvariable=value_var, bg="#132033", fg=self.text, font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=8, pady=(0, 5))
-
-    def _set_active_scroll_canvas(self, canvas: tk.Canvas):
-        self.active_scroll_canvas = canvas
-
-    def _on_mousewheel_global(self, event):
-        canvas = self.active_scroll_canvas
-        if canvas is None or event.widget.winfo_toplevel() is not self.root:
-            return
-        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-    def _update_system_info(self):
-        self.ram_var.set(self._get_ram_text())
-        self.cpu_var.set(self._get_cpu_text())
-        self.gpu_var.set(self._get_gpu_text())
-        self.cpu_temp_var.set(self._get_cpu_temp_text())
-        self.gpu_temp_var.set(self._get_gpu_temp_text())
-        self.root.after(1000, self._update_system_info)
-
-    def _format_elapsed(self, seconds: float) -> str:
-        total_seconds = max(0, int(seconds))
-        hours, remainder = divmod(total_seconds, 3600)
-        minutes, secs = divmod(remainder, 60)
-        return f"⏱ {hours:02d}:{minutes:02d}:{secs:02d}"
-
-    def _start_caption_timer(self):
-        self.caption_timer_running = True
-        self.caption_timer_start = time.perf_counter()
-        self.caption_timer_var.set(f"⏱ Running | Last Image Took: {self.last_caption_elapsed}")
-        self._update_caption_timer()
-
-    def _update_caption_timer(self):
-        if not self.caption_timer_running:
-            return
-        elapsed = time.perf_counter() - self.caption_timer_start
-        self.caption_timer_var.set(f"⏱ Running {self._format_elapsed(elapsed)} | Last Image Took: {self.last_caption_elapsed}")
-        self.caption_timer_job = self.root.after(250, self._update_caption_timer)
-
-    def _stop_caption_timer(self, keep_elapsed: bool = True):
-        if self.caption_timer_job is not None:
-            try:
-                self.root.after_cancel(self.caption_timer_job)
-            except Exception:
-                pass
-            self.caption_timer_job = None
-        elapsed = time.perf_counter() - self.caption_timer_start if self.caption_timer_running else 0.0
-        self.caption_timer_running = False
-        if keep_elapsed:
-            elapsed_text = self._format_elapsed(elapsed)
-            self.last_caption_elapsed = elapsed_text.replace("⏱ ", "")
-        self.caption_timer_var.set(f"⏱ Idle | Last Image Took: {self.last_caption_elapsed}")
-
-    def _reset_caption_timer(self):
-        self._stop_caption_timer(keep_elapsed=False)
-
-    def _get_ram_text(self) -> str:
-        if psutil is None:
-            return "RAM: N/A"
-        vm = psutil.virtual_memory()
-        return f"RAM: {vm.percent:.0f}%"
-
-    def _get_cpu_text(self) -> str:
-        if psutil is None:
-            return "CPU: N/A"
-        return f"CPU: {psutil.cpu_percent(interval=None):.0f}%"
-
-    def _get_cpu_temp_text(self) -> str:
-        temp = self._read_cpu_temp()
-        return f"CPU TEMP: {temp}" if temp else "CPU TEMP: N/A"
-
-    def _read_cpu_temp(self) -> str | None:
-        sensors_temperatures = getattr(psutil, "sensors_temperatures", None) if psutil is not None else None
-        if callable(sensors_temperatures):
-            try:
-                temps = sensors_temperatures(fahrenheit=False)
-                temp_groups = cast(dict[Any, Any], temps).values()
-                for entries in temp_groups:
-                    for entry in entries:
-                        if entry.current is not None:
-                            return f"{entry.current:.0f}°C"
-            except Exception:
-                pass
-
-        try:
-            result = subprocess.run(
-                ["wmic", "/namespace:\\root\\wmi", "PATH", "MSAcpi_ThermalZoneTemperature", "get", "CurrentTemperature"],
-                capture_output=True,
-                text=True,
-                timeout=2,
-            )
-            values = []
-            for line in result.stdout.splitlines():
-                line = line.strip()
-                if line.isdigit():
-                    values.append(int(line))
-            if values:
-                celsius = (values[0] / 10.0) - 273.15
-                return f"{celsius:.0f}°C"
-        except Exception:
-            pass
-        return None
-
-    def _get_gpu_text(self) -> str:
-        if not torch.cuda.is_available():
-            return "GPU: N/A"
-        try:
-            result = subprocess.run(
-                ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
-                capture_output=True,
-                text=True,
-                timeout=2,
-            )
-            value = result.stdout.strip().splitlines()[0].strip()
-            return f"GPU: {value}%"
-        except Exception:
-            try:
-                return f"GPU: {torch.cuda.get_device_name(0)}"
-            except Exception:
-                return "GPU: CUDA"
-
-    def _get_gpu_temp_text(self) -> str:
-        if not torch.cuda.is_available():
-            return "GPU TEMP: N/A"
-        try:
-            result = subprocess.run(
-                ["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"],
-                capture_output=True,
-                text=True,
-                timeout=2,
-            )
-            value = result.stdout.strip().splitlines()[0].strip()
-            return f"GPU TEMP: {value}°C"
-        except Exception:
-            return "GPU TEMP: N/A"
-
-    def _build_settings_panel(self, parent: tk.Frame):
-        panel = tk.Frame(parent, bg=self.panel, bd=0, highlightbackground=self.border, highlightthickness=1)
-        panel.pack(fill=Y, expand=False)
-
-        top = tk.Frame(panel, bg=self.panel)
-        top.pack(fill=X, padx=16, pady=(16, 10))
-        tk.Label(top, text="⚙️ Settings", bg=self.panel, fg=self.text, font=("Segoe UI", 14, "bold")).pack(anchor="w")
+    def _make_chip(self, parent: tk.Widget, var: tk.StringVar):
+        frame = tk.Frame(parent, bg=self.card, highlightbackground=self.border, highlightthickness=1)
+        frame.pack(side="left", padx=(0, 8))
         tk.Label(
-            top,
-            text="Use a LLaVA-compatible vision model for best results.",
-            bg=self.panel,
-            fg=self.muted,
-            font=("Segoe UI", 9),
-            wraplength=340,
-            justify="left",
-        ).pack(anchor="w", pady=(3, 0))
-
-        form = tk.Frame(panel, bg=self.panel)
-        form.pack(fill=BOTH, expand=True, padx=16, pady=(0, 14))
-
-        self.model_name_var = tk.StringVar(value=DEFAULT_MODEL_NAME)
-        self.hf_token_var = tk.StringVar(value="")
-        self.image_path_var = tk.StringVar()
-        self.save_path_var = tk.StringVar()
-        self.batch_image_folder_var = tk.StringVar()
-        self.batch_save_folder_var = tk.StringVar()
-        self.batch_prefix_var = tk.StringVar()
-        self.caption_prefix_position_var = tk.StringVar(value="front")
-        self.save_format_var = tk.StringVar(value="txt")
-        self.output_length_var = tk.IntVar(value=128)
-        self.temperature_var = tk.DoubleVar(value=0.6)
-        self.top_p_var = tk.DoubleVar(value=0.9)
-        self.top_k_var = tk.IntVar(value=40)
-        self.repetition_var = tk.DoubleVar(value=1.05)
-        self.do_sample_var = tk.BooleanVar(value=False)
-
-        self._section_label(form, "🧠 Model name")
-        self.model_entry = tk.Entry(
-            form,
-            textvariable=self.model_name_var,
-            bg="#12203a",
+            frame,
+            textvariable=var,
+            bg=self.card,
             fg=self.text,
-            insertbackground=self.text,
-            relief="flat",
-            font=("Segoe UI", 10),
-        )
-        self.model_entry.pack(fill=X, pady=(6, 12), ipady=7)
+            font=("Segoe UI", 9, "bold"),
+            padx=10,
+            pady=6,
+        ).pack()
 
-        self._section_label(form, "🔐 Hugging Face token (optional)")
-        self.hf_token_entry = PlaceholderEntry(
-            form,
-            placeholder="hf_...",
-            placeholder_fg=self.muted,
-            text_fg=self.text,
-            bg="#12203a",
-            fg=self.text,
-            insertbackground=self.text,
-            relief="flat",
-            font=("Segoe UI", 10),
-        )
-        self.hf_token_entry.pack(fill=X, pady=(6, 12), ipady=7)
+    def _build_left_panel(self, parent: tk.Widget):
+        wrapper = tk.Frame(parent, bg=self.panel, highlightbackground=self.border, highlightthickness=1)
+        wrapper.pack(fill="both", expand=True)
 
-        self._build_preview_card(form)
+        notebook = ttk.Notebook(wrapper)
+        notebook.pack(fill="both", expand=True, padx=10, pady=(10, 0))
 
-        self._section_label(form, "🖼️ Image path")
-        image_row = tk.Frame(form, bg=self.panel)
-        image_row.pack(fill=X, pady=(6, 12))
-        self.image_entry = PlaceholderEntry(
-            image_row,
-            placeholder=DEFAULT_IMAGE_HINT,
-            placeholder_fg=self.muted,
-            text_fg=self.text,
-            bg="#12203a",
-            fg=self.text,
-            insertbackground=self.text,
-            relief="flat",
-            font=("Segoe UI", 10),
-        )
-        self.image_entry.pack(side=LEFT, fill=X, expand=True, ipady=7)
-        self.image_entry.bind("<FocusOut>", lambda _event: self._update_preview_from_entry())
-        tk.Button(
-            image_row,
-            text="📂",
-            command=self._choose_image,
-            bg="#263754",
-            fg=self.text,
-            activebackground="#334866",
-            activeforeground=self.text,
-            relief="flat",
-            font=("Segoe UI", 10, "bold"),
-            width=4,
-        ).pack(side=RIGHT, padx=(8, 0), ipady=4)
+        tab_run_outer = tk.Frame(notebook, bg=self.panel)
+        tab_prompts_outer = tk.Frame(notebook, bg=self.panel)
+        tab_batch_outer = tk.Frame(notebook, bg=self.panel)
+        tab_advanced_outer = tk.Frame(notebook, bg=self.panel)
 
-        self.batch_toggle = tk.Checkbutton(
-            form,
-            text="🗂️ Enable multi-image folder mode",
-            variable=self.batch_mode_var,
-            command=self._toggle_batch_mode,
-            bg=self.panel,
-            fg=self.text,
-            activebackground=self.panel,
-            activeforeground=self.text,
-            selectcolor=self.panel_alt,
-            font=("Segoe UI", 10),
-            relief="flat",
-        )
-        self.batch_toggle.pack(anchor="w", pady=(2, 8))
+        self.tab_run = self._make_scrollable_tab(tab_run_outer)
+        self.tab_prompts = self._make_scrollable_tab(tab_prompts_outer)
+        self.tab_batch = self._make_scrollable_tab(tab_batch_outer)
+        self.tab_advanced = self._make_scrollable_tab(tab_advanced_outer)
 
-        self.batch_frame = tk.Frame(form, bg=self.panel)
-        self._build_batch_controls(self.batch_frame)
-        self.batch_frame.pack_forget()
+        notebook.add(tab_run_outer, text="Run")
+        notebook.add(tab_prompts_outer, text="Prompts")
+        notebook.add(tab_batch_outer, text="Batch")
+        notebook.add(tab_advanced_outer, text="Advanced")
 
-        self._section_label(form, "💾 Save path (optional)")
-        save_row = tk.Frame(form, bg=self.panel)
-        save_row.pack(fill=X, pady=(6, 8))
-        self.save_entry = PlaceholderEntry(
-            save_row,
-            placeholder=DEFAULT_SAVE_HINT,
-            placeholder_fg=self.muted,
-            text_fg=self.text,
-            bg="#12203a",
-            fg=self.text,
-            insertbackground=self.text,
-            relief="flat",
-            font=("Segoe UI", 10),
-        )
-        self.save_entry.pack(side=LEFT, fill=X, expand=True, ipady=7)
-        tk.Button(
-            save_row,
-            text="💾",
-            command=self._choose_save_path,
-            bg="#263754",
-            fg=self.text,
-            activebackground="#334866",
-            activeforeground=self.text,
-            relief="flat",
-            font=("Segoe UI", 10, "bold"),
-            width=4,
-        ).pack(side=RIGHT, padx=(8, 0), ipady=4)
+        self._build_run_tab()
+        self._build_prompts_tab()
+        self._build_batch_tab()
+        self._build_advanced_tab()
+        self._build_utility_bar(wrapper)
 
-        save_format_row = tk.Frame(form, bg=self.panel)
-        save_format_row.pack(fill=X, pady=(0, 10))
-        tk.Label(save_format_row, text="Format", bg=self.panel, fg=self.muted, font=("Segoe UI", 9)).pack(side=LEFT)
-        save_format = ttk.Combobox(
-            save_format_row,
-            textvariable=self.save_format_var,
-            values=("txt", "json"),
-            state="readonly",
-            width=10,
-        )
-        save_format.pack(side=RIGHT)
+    def _make_scrollable_tab(self, parent: tk.Widget) -> tk.Frame:
+        canvas = tk.Canvas(parent, bg=self.panel, bd=0, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        inner = tk.Frame(canvas, bg=self.panel)
 
-        self._section_label(form, "🗣️ Caption prefix (optional)")
-        caption_prefix_row = tk.Frame(form, bg=self.panel)
-        caption_prefix_row.pack(fill=X, pady=(6, 6))
-        self.caption_prefix_entry = PlaceholderEntry(
-            caption_prefix_row,
-            placeholder=DEFAULT_CAPTION_PREFIX_HINT,
-            placeholder_fg=self.muted,
-            text_fg=self.text,
-            bg="#12203a",
-            fg=self.text,
-            insertbackground=self.text,
-            relief="flat",
-            font=("Segoe UI", 10),
-        )
-        self.caption_prefix_entry.pack(side=LEFT, fill=X, expand=True, ipady=7)
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
 
-        caption_prefix_position = ttk.Combobox(
-            caption_prefix_row,
-            textvariable=self.caption_prefix_position_var,
-            values=("front", "last"),
-            state="readonly",
-            width=10,
-        )
-        caption_prefix_position.pack(side=RIGHT, padx=(8, 0))
+        def refresh_scrollregion(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
 
-        self._section_label(form, "✍️ Prompt")
-        prompt_hint = tk.Label(
-            form,
-            text="Edit this only if you want a custom prompt template.",
-            bg=self.panel,
-            fg=self.muted,
-            font=("Segoe UI", 9),
-            wraplength=340,
-            justify="left",
-        )
-        prompt_hint.pack(anchor="w", pady=(4, 4))
+        def sync_width(event):
+            canvas.itemconfigure(window_id, width=event.width)
 
-        self.prompt_text = scrolledtext.ScrolledText(
-            form,
-            height=7,
-            wrap=tk.WORD,
-            bg="#12203a",
-            fg=self.text,
-            insertbackground=self.text,
-            relief="flat",
-            font=("Segoe UI", 10),
-        )
-        self.prompt_text.pack(fill=X, pady=(0, 12))
-        self.prompt_text.insert("1.0", DEFAULT_PROMPT)
+        inner.bind("<Configure>", refresh_scrollregion)
+        canvas.bind("<Configure>", sync_width)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        return inner
 
-        self._section_label(form, "📏 Output length")
-        length_row = tk.Frame(form, bg=self.panel)
-        length_row.pack(fill=X, pady=(6, 2))
-        self.length_value_label = tk.Label(length_row, text="128", bg=self.panel, fg=self.accent, font=("Segoe UI", 10, "bold"))
-        self.length_value_label.pack(side=RIGHT)
-        self.length_scale = tk.Scale(
-            form,
-            from_=0,
-            to=512,
-            orient="horizontal",
-            variable=self.output_length_var,
-            bg=self.panel,
-            fg=self.text,
-            troughcolor="#24324d",
-            highlightthickness=0,
-            activebackground=self.accent,
-            relief="flat",
-            command=self._sync_length_label,
-        )
-        self.length_scale.pack(fill=X, pady=(0, 10))
+    def _build_utility_bar(self, parent: tk.Widget):
+        bar = tk.Frame(parent, bg=self.panel, highlightbackground=self.border, highlightthickness=1)
+        bar.pack(fill="x", padx=10, pady=10)
 
-        self._section_label(form, "🎛️ Extra generation values")
-        self._slider_block(form, "Temperature", self.temperature_var, 0.0, 2.0, 0.05, "0.60")
-        self._slider_block(form, "Top-p", self.top_p_var, 0.0, 1.0, 0.01, "0.90")
-        self._slider_block(form, "Top-k", self.top_k_var, 0, 100, 1, "40")
-        self._slider_block(form, "Repetition penalty", self.repetition_var, 1.0, 2.0, 0.01, "1.05")
+        utility_row = tk.Frame(bar, bg=self.panel)
+        utility_row.pack(fill="x", padx=8, pady=8)
+        ttk.Button(utility_row, text="Clear Output", style="Soft.TButton", command=self.clear_output).pack(side="left", fill="x", expand=True)
+        ttk.Button(utility_row, text="Reset Defaults", style="Soft.TButton", command=self.reset_defaults).pack(side="left", fill="x", expand=True, padx=(8, 0))
 
-        self.sample_check = tk.Checkbutton(
-            form,
-            text="🎲 Use sampling (slower, more varied)",
-            variable=self.do_sample_var,
-            bg=self.panel,
-            fg=self.text,
-            activebackground=self.panel,
-            activeforeground=self.text,
-            selectcolor=self.panel_alt,
-            font=("Segoe UI", 10),
-            relief="flat",
-        )
-        self.sample_check.pack(anchor="w", pady=(8, 12))
+    def _build_right_panel(self, parent: tk.Widget):
+        top = tk.Frame(parent, bg=self.bg)
+        top.pack(fill="x", pady=(0, 10))
 
-        self.generate_button = ttk.Button(form, text="✨ Generate Caption", style="Accent.TButton", command=self.generate_caption)
-        self.generate_button.pack(fill=X, pady=(8, 0), ipady=2)
+        state_row = tk.Frame(top, bg=self.bg)
+        state_row.pack(fill="x")
 
-        self.stop_button = ttk.Button(form, text="🛑 Stop", style="Danger.TButton", command=self.stop_captioning, state="disabled")
-        self.stop_button.pack(fill=X, pady=(8, 0), ipady=2)
-
-        quick_row = tk.Frame(form, bg=self.panel)
-        quick_row.pack(fill=X, pady=(10, 0))
-        ttk.Button(quick_row, text="🧹 Clear Output", style="Soft.TButton", command=self._clear_output).pack(side=LEFT, fill=X, expand=True)
-        ttk.Button(quick_row, text="🔁 Reset Defaults", style="Soft.TButton", command=self._reset_defaults).pack(side=LEFT, fill=X, expand=True, padx=(8, 0))
-
-    def _build_batch_controls(self, parent: tk.Frame):
-        card = tk.Frame(parent, bg=self.panel_alt, bd=0, highlightbackground=self.border, highlightthickness=1)
-        card.pack(fill=X, pady=(0, 12))
-
-        header = tk.Frame(card, bg=self.panel_alt)
-        header.pack(fill=X, padx=12, pady=(10, 6))
-        tk.Label(header, text="📚 Multi-image mode", bg=self.panel_alt, fg=self.text, font=("Segoe UI", 11, "bold")).pack(anchor="w")
         tk.Label(
-            header,
-            text="Choose a folder of images, then choose where the captions should be saved.",
-            bg=self.panel_alt,
+            state_row,
+            textvariable=self.model_state_var,
+            bg=self.bg,
+            fg=self.accent,
+            font=("Segoe UI", 10, "bold"),
+        ).pack(side="left")
+
+        tk.Label(
+            state_row,
+            textvariable=self.current_item_var,
+            bg=self.bg,
             fg=self.muted,
-            font=("Segoe UI", 9),
-            wraplength=320,
-            justify="left",
-        ).pack(anchor="w", pady=(2, 0))
-
-        source_row = tk.Frame(card, bg=self.panel_alt)
-        source_row.pack(fill=X, padx=12, pady=(6, 8))
-        tk.Label(source_row, text="Images folder", bg=self.panel_alt, fg=self.text, font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        folder_row = tk.Frame(source_row, bg=self.panel_alt)
-        folder_row.pack(fill=X, pady=(5, 0))
-        self.batch_image_folder_entry = PlaceholderEntry(
-            folder_row,
-            placeholder="Choose a folder with images...",
-            placeholder_fg=self.muted,
-            text_fg=self.text,
-            bg="#12203a",
-            fg=self.text,
-            insertbackground=self.text,
-            relief="flat",
             font=("Segoe UI", 10),
-        )
-        self.batch_image_folder_entry.pack(side=LEFT, fill=X, expand=True, ipady=7)
-        tk.Button(
-            folder_row,
-            text="📁",
-            command=self._choose_batch_images_folder,
-            bg="#263754",
-            fg=self.text,
-            activebackground="#334866",
-            activeforeground=self.text,
-            relief="flat",
-            font=("Segoe UI", 10, "bold"),
-            width=4,
-        ).pack(side=RIGHT, padx=(8, 0), ipady=4)
+        ).pack(side="right")
 
-        save_row = tk.Frame(card, bg=self.panel_alt)
-        save_row.pack(fill=X, padx=12, pady=(4, 8))
-        tk.Label(save_row, text="Save captions folder", bg=self.panel_alt, fg=self.text, font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        save_folder_row = tk.Frame(save_row, bg=self.panel_alt)
-        save_folder_row.pack(fill=X, pady=(5, 0))
-        self.batch_save_folder_entry = PlaceholderEntry(
-            save_folder_row,
-            placeholder="Choose a folder for captions...",
-            placeholder_fg=self.muted,
-            text_fg=self.text,
-            bg="#12203a",
-            fg=self.text,
-            insertbackground=self.text,
-            relief="flat",
-            font=("Segoe UI", 10),
-        )
-        self.batch_save_folder_entry.pack(side=LEFT, fill=X, expand=True, ipady=7)
-        tk.Button(
-            save_folder_row,
-            text="📁",
-            command=self._choose_batch_save_folder,
-            bg="#263754",
-            fg=self.text,
-            activebackground="#334866",
-            activeforeground=self.text,
-            relief="flat",
-            font=("Segoe UI", 10, "bold"),
-            width=4,
-        ).pack(side=RIGHT, padx=(8, 0), ipady=4)
+        preview_card = tk.Frame(parent, bg=self.panel, highlightbackground=self.border, highlightthickness=1)
+        preview_card.pack(fill="x", pady=(0, 10))
 
-        prefix_row = tk.Frame(card, bg=self.panel_alt)
-        prefix_row.pack(fill=X, padx=12, pady=(2, 12))
-        tk.Label(prefix_row, text="Filename prefix", bg=self.panel_alt, fg=self.text, font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        self.batch_prefix_entry = PlaceholderEntry(
-            prefix_row,
-            placeholder="Optional, for example: photo",
-            placeholder_fg=self.muted,
-            text_fg=self.text,
-            bg="#12203a",
-            fg=self.text,
-            insertbackground=self.text,
-            relief="flat",
-            font=("Segoe UI", 10),
-        )
-        self.batch_prefix_entry.pack(fill=X, pady=(5, 0), ipady=7)
+        preview_header = tk.Frame(preview_card, bg=self.panel)
+        preview_header.pack(fill="x", padx=12, pady=(10, 8))
 
-    def _toggle_batch_mode(self):
-        if self.batch_mode_var.get():
-            self.batch_frame.pack(fill=X, pady=(0, 4))
-            self.generate_button.config(text="✨ Generate Batch Captions")
-        else:
-            self.batch_frame.pack_forget()
-            self.generate_button.config(text="✨ Generate Caption")
+        tk.Label(preview_header, text="Preview", bg=self.panel, fg=self.text, font=("Segoe UI", 12, "bold")).pack(side="left")
+        tk.Label(preview_header, textvariable=self.batch_progress_var, bg=self.panel, fg=self.muted, font=("Segoe UI", 9)).pack(side="right")
 
-    def _build_preview_card(self, parent: tk.Widget):
-        card = tk.Frame(parent, bg=self.panel_alt, bd=0, highlightbackground=self.border, highlightthickness=1)
-        card.pack(fill=X, pady=(0, 12))
-
-        header = tk.Frame(card, bg=self.panel_alt)
-        header.pack(fill=X, padx=12, pady=(10, 6))
-        tk.Label(header, text="🖼️ Image Preview", bg=self.panel_alt, fg=self.text, font=("Segoe UI", 11, "bold")).pack(side=LEFT)
-        tk.Label(header, text="thumbnail", bg=self.panel_alt, fg=self.muted, font=("Segoe UI", 9)).pack(side=RIGHT)
-
-        self.preview_container = tk.Frame(card, bg="#0d1424")
-        self.preview_container.pack(fill=X, padx=12, pady=(0, 12))
         self.preview_canvas = tk.Canvas(
-            self.preview_container,
-            width=340,
-            height=240,
-            bg="#0d1424",
-            highlightthickness=1,
-            highlightbackground=self.border,
+            preview_card,
+            width=760,
+            height=320,
+            bg="#0a1322",
             bd=0,
+            highlightbackground=self.border,
+            highlightthickness=1,
         )
-        self.preview_canvas.pack(fill=X, padx=10, pady=10)
+        self.preview_canvas.pack(fill="x", padx=12, pady=(0, 12))
         self._clear_preview()
 
-    def _build_output_panel(self, parent: tk.Frame):
-        panel = tk.Frame(parent, bg=self.panel, bd=0, highlightbackground=self.border, highlightthickness=1)
-        panel.pack(fill=BOTH, expand=True)
+        output_card = tk.Frame(parent, bg=self.panel, highlightbackground=self.border, highlightthickness=1)
+        output_card.pack(fill="both", expand=True)
 
-        top = tk.Frame(panel, bg=self.panel)
-        top.pack(fill=X, padx=16, pady=(16, 8))
-        tk.Label(top, text="📝 Caption Output", bg=self.panel, fg=self.text, font=("Segoe UI", 14, "bold")).pack(anchor="w")
-        tk.Label(
-            top,
-            text="Your generated caption will appear here, and can also be saved to disk if you choose a save path.",
-            bg=self.panel,
-            fg=self.muted,
-            font=("Segoe UI", 9),
-            wraplength=620,
-            justify="left",
-        ).pack(anchor="w", pady=(3, 0))
+        output_tabs = ttk.Notebook(output_card)
+        output_tabs.pack(fill="both", expand=True, padx=10, pady=10)
+
+        out_tab = tk.Frame(output_tabs, bg=self.panel)
+        log_tab = tk.Frame(output_tabs, bg=self.panel)
+
+        output_tabs.add(out_tab, text="Caption Output")
+        output_tabs.add(log_tab, text="Debug Logs")
 
         self.output_text = scrolledtext.ScrolledText(
-            panel,
+            out_tab,
             wrap=tk.WORD,
-            bg="#0d1424",
+            bg="#0a1322",
             fg=self.text,
             insertbackground=self.text,
             relief="flat",
             font=("Segoe UI", 11),
         )
-        self.output_text.pack(fill=BOTH, expand=True, padx=16, pady=(0, 14))
-        self.output_text.insert("1.0", "Ready. Choose an image and click Generate.")
+        self.output_text.pack(fill="both", expand=True, padx=8, pady=8)
+        self.output_text.insert("1.0", "Ready. Generate a caption to see results.")
         self.output_text.configure(state="disabled")
 
-        self.status_label = tk.Label(
-            panel,
-            text="",
-            bg=self.panel,
-            fg=self.muted,
-            anchor="w",
-            font=("Segoe UI", 10),
-        )
-        self.status_label.pack(fill=X, padx=16, pady=(0, 10))
-
-        debug_row = tk.Frame(panel, bg=self.panel)
-        debug_row.pack(fill=X, padx=16, pady=(0, 8))
-        self.debug_toggle = tk.Checkbutton(
-            debug_row,
-            text="🐞 Show debug logs",
-            variable=self.debug_visible,
-            command=self._toggle_debug_logs,
-            bg=self.panel,
-            fg=self.text,
-            activebackground=self.panel,
-            activeforeground=self.text,
-            selectcolor=self.panel_alt,
-            font=("Segoe UI", 10),
-            relief="flat",
-        )
-        self.debug_toggle.pack(anchor="w")
-
-        self.debug_panel = tk.Frame(panel, bg="#0d1424", bd=0, highlightbackground=self.border, highlightthickness=1)
-        self.debug_header = tk.Label(
-            self.debug_panel,
-            text="🔎 Debug Logs",
-            bg="#0d1424",
-            fg=self.accent,
-            anchor="w",
-            font=("Segoe UI", 10, "bold"),
-        )
-        self.debug_header.pack(fill=X, padx=10, pady=(8, 4))
         self.debug_text = scrolledtext.ScrolledText(
-            self.debug_panel,
-            height=8,
+            log_tab,
             wrap=tk.WORD,
-            bg="#08111f",
-            fg="#8be9fd",
+            bg="#08101c",
+            fg="#9ad0ff",
             insertbackground=self.text,
             relief="flat",
             font=("Consolas", 9),
         )
-        self.debug_text.pack(fill=BOTH, expand=True, padx=10, pady=(0, 10))
+        self.debug_text.pack(fill="both", expand=True, padx=8, pady=8)
         self.debug_text.configure(state="disabled")
-        self._toggle_debug_logs()
 
-    def _build_footer(self):
-        footer = tk.Frame(self.root, bg=self.bg)
-        footer.pack(fill=X, padx=20, pady=(0, 14))
+        status_bar = tk.Frame(parent, bg=self.bg)
+        status_bar.pack(fill="x", pady=(8, 0))
+        self.status_label = tk.Label(status_bar, text="", bg=self.bg, fg=self.muted, anchor="w", font=("Segoe UI", 10))
+        self.status_label.pack(fill="x")
+
+    def _build_run_tab(self):
+        frame = self.tab_run
+
+        self._label(frame, "Model")
+        self._entry(frame, self.model_name_var)
+
+        self._label(frame, "Hugging Face token (optional)")
+        token_entry = tk.Entry(
+            frame,
+            textvariable=self.hf_token_var,
+            bg="#0d1628",
+            fg=self.text,
+            insertbackground=self.text,
+            relief="flat",
+            font=("Segoe UI", 10),
+        )
+        token_entry.pack(fill="x", padx=14, pady=(4, 10), ipady=7)
+
+        row1 = tk.Frame(frame, bg=self.panel)
+        row1.pack(fill="x", padx=14, pady=(0, 10))
+        ttk.Button(row1, text="Load Model", style="Soft.TButton", command=self.load_model_async).pack(side="left", fill="x", expand=True)
+        ttk.Button(row1, text="Unload Model", style="Soft.TButton", command=self.unload_model).pack(side="left", fill="x", expand=True, padx=(8, 0))
+
+        mode_card = tk.Frame(frame, bg=self.panel_alt, highlightbackground=self.border, highlightthickness=1)
+        mode_card.pack(fill="x", padx=14, pady=(0, 10))
+        tk.Checkbutton(
+            mode_card,
+            text="Enable thinking mode",
+            variable=self.enable_thinking_var,
+            bg=self.panel_alt,
+            fg=self.text,
+            activebackground=self.panel_alt,
+            activeforeground=self.text,
+            selectcolor=self.card,
+            relief="flat",
+            font=("Segoe UI", 10),
+        ).pack(anchor="w", padx=12, pady=10)
+
+        self._build_performance_card(frame)
+
+        run_row = tk.Frame(frame, bg=self.panel)
+        run_row.pack(fill="x", padx=14, pady=(0, 10))
+        self.generate_button = ttk.Button(run_row, text="Generate", style="Primary.TButton", command=self.generate_async)
+        self.generate_button.pack(side="left", fill="x", expand=True)
+
+        self.stop_button = ttk.Button(run_row, text="Stop", style="Danger.TButton", command=self.request_stop, state="disabled")
+        self.stop_button.pack(side="left", fill="x", expand=True, padx=(8, 0))
+
+        self._label(frame, "Image")
+        self.image_entry = self._path_row(frame, self.image_path_var, self.choose_image)
+
+        self._label(frame, "Save path (optional for single image)")
+        self._path_row(frame, self.save_path_var, self.choose_save_path)
+
+        combo_row = tk.Frame(frame, bg=self.panel)
+        combo_row.pack(fill="x", padx=14, pady=(0, 10))
+        tk.Label(combo_row, text="Save format", bg=self.panel, fg=self.muted, font=("Segoe UI", 10)).pack(side="left")
+        ttk.Combobox(
+            combo_row,
+            textvariable=self.save_format_var,
+            values=("txt", "json"),
+            state="readonly",
+            width=10,
+        ).pack(side="right")
+
+        self._build_prompt_detail_card(frame)
+
+    def _build_performance_card(self, parent: tk.Widget):
+        card = tk.Frame(parent, bg=self.panel_alt, highlightbackground=self.border, highlightthickness=1)
+        card.pack(fill="x", padx=14, pady=(0, 10))
+        self._label_inside(card, "Performance")
+
+        self._label_inside_small(card, "Speed preset")
+        preset_combo = ttk.Combobox(
+            card,
+            textvariable=self.speed_preset_var,
+            values=tuple(SPEED_PRESETS.keys()),
+            state="readonly",
+        )
+        preset_combo.pack(fill="x", padx=12, pady=(0, 8))
+        preset_combo.bind("<<ComboboxSelected>>", lambda _event: self._apply_speed_preset())
+
+        self._label_inside_small(card, "Attention backend")
+        ttk.Combobox(
+            card,
+            textvariable=self.attn_backend_var,
+            values=("flash_attention_2", "sdpa", "eager"),
+            state="readonly",
+        ).pack(fill="x", padx=12, pady=(0, 8))
+
+        tk.Checkbutton(
+            card,
+            text="Prewarm after model load",
+            variable=self.prewarm_var,
+            bg=self.panel_alt,
+            fg=self.text,
+            activebackground=self.panel_alt,
+            activeforeground=self.text,
+            selectcolor=self.card,
+            relief="flat",
+            font=("Segoe UI", 10),
+        ).pack(anchor="w", padx=12, pady=(0, 6))
+
         tk.Label(
-            footer,
-            text="Tip: shorter output is faster; sampling adds variety but usually slows generation a bit.",
-            bg=self.bg,
+            card,
+            text="FlashAttention is tried first and falls back to SDPA if unavailable.",
+            bg=self.panel_alt,
             fg=self.muted,
             font=("Segoe UI", 9),
+            justify="left",
+            wraplength=360,
+        ).pack(anchor="w", padx=12, pady=(0, 10))
+
+    def _build_prompt_detail_card(self, parent: tk.Widget):
+        settings_card = tk.Frame(parent, bg=self.panel_alt, highlightbackground=self.border, highlightthickness=1)
+        settings_card.pack(fill="x", padx=14, pady=(0, 10))
+
+        self._label_inside(settings_card, "Prompt detail")
+        tk.Label(
+            settings_card,
+            textvariable=self.prompt_detail_var,
+            bg=self.panel_alt,
+            fg=self.muted,
+            font=("Segoe UI", 9),
+            justify="left",
+            wraplength=360,
+        ).pack(anchor="w", padx=12, pady=(0, 8))
+
+        self._scale_block(settings_card, "Max new tokens", self.max_new_tokens_var, 32, 384, 8)
+        self._scale_block(settings_card, "Max image side", self.max_image_side_var, 512, 1024, 64)
+        self._update_prompt_detail()
+
+    def _apply_speed_preset(self):
+        preset_name = self.speed_preset_var.get()
+        preset = SPEED_PRESETS.get(preset_name, SPEED_PRESETS[DEFAULT_SPEED_PRESET])
+        self.max_new_tokens_var.set(int(preset["max_new_tokens"]))
+        self.max_image_side_var.set(int(preset["max_image_side"]))
+        self.enable_thinking_var.set(bool(preset["thinking"]))
+        self._update_prompt_detail()
+        self._set_status(f"Speed preset applied: {preset_name}.")
+
+    def _update_prompt_detail(self):
+        if not hasattr(self, "prompt_detail_var"):
+            return
+        self.prompt_detail_var.set(
+            f"{self.speed_preset_var.get()} preset: "
+            f"{int(self.max_new_tokens_var.get())} tokens, "
+            f"{int(self.max_image_side_var.get())} px image side."
+        )
+
+    def _build_prompts_tab(self):
+        frame = self.tab_prompts
+
+        self._label(frame, "System prompt")
+        self.system_prompt_text = scrolledtext.ScrolledText(
+            frame,
+            height=8,
+            wrap=tk.WORD,
+            bg="#0d1628",
+            fg=self.text,
+            insertbackground=self.text,
+            relief="flat",
+            font=("Segoe UI", 10),
+        )
+        self.system_prompt_text.pack(fill="x", padx=14, pady=(4, 12))
+        self.system_prompt_text.insert("1.0", DEFAULT_SYSTEM_PROMPT)
+
+        self._label(frame, "User prompt")
+        self.user_prompt_text = scrolledtext.ScrolledText(
+            frame,
+            height=12,
+            wrap=tk.WORD,
+            bg="#0d1628",
+            fg=self.text,
+            insertbackground=self.text,
+            relief="flat",
+            font=("Segoe UI", 10),
+        )
+        self.user_prompt_text.pack(fill="both", expand=True, padx=14, pady=(4, 12))
+        self.user_prompt_text.insert("1.0", DEFAULT_USER_PROMPT)
+
+    def _build_batch_tab(self):
+        frame = self.tab_batch
+
+        top = tk.Frame(frame, bg=self.panel)
+        top.pack(fill="x", padx=14, pady=(12, 10))
+
+        tk.Checkbutton(
+            top,
+            text="Enable batch folder mode",
+            variable=self.batch_mode_var,
+            bg=self.panel,
+            fg=self.text,
+            activebackground=self.panel,
+            activeforeground=self.text,
+            selectcolor=self.card,
+            relief="flat",
+            font=("Segoe UI", 10),
         ).pack(anchor="w")
 
-    def _section_label(self, parent: tk.Widget, text: str):
-        tk.Label(parent, text=text, bg=self.panel, fg=self.text, font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        self._label(frame, "Batch image folder")
+        self._path_row(frame, self.batch_folder_var, self.choose_batch_folder)
 
-    def _slider_block(self, parent: tk.Widget, label: str, variable, from_: float, to: float, resolution: float, value_text: str):
-        block = tk.Frame(parent, bg=self.panel)
-        block.pack(fill=X, pady=(6, 0))
-        row = tk.Frame(block, bg=self.panel)
-        row.pack(fill=X)
-        tk.Label(row, text=f"{label}", bg=self.panel, fg=self.text, font=("Segoe UI", 10)).pack(side=LEFT)
-        value_label = tk.Label(row, text=value_text, bg=self.panel, fg=self.accent, font=("Segoe UI", 10, "bold"))
-        value_label.pack(side=RIGHT)
+        self._label(frame, "Batch save folder")
+        self._path_row(frame, self.batch_save_folder_var, self.choose_batch_save_folder)
 
-        slider = tk.Scale(
+        self._label(frame, "Optional filename prefix")
+        self._entry(frame, self.batch_prefix_var)
+
+        opts = tk.Frame(frame, bg=self.panel)
+        opts.pack(fill="x", padx=14, pady=(6, 0))
+        tk.Checkbutton(
+            opts,
+            text="Skip existing output files",
+            variable=self.skip_existing_var,
+            bg=self.panel,
+            fg=self.text,
+            activebackground=self.panel,
+            activeforeground=self.text,
+            selectcolor=self.card,
+            relief="flat",
+            font=("Segoe UI", 10),
+        ).pack(anchor="w")
+
+        note = tk.Label(
+            frame,
+            text="Batch mode processes one image at a time to keep memory use predictable.",
+            bg=self.panel,
+            fg=self.muted,
+            font=("Segoe UI", 9),
+            justify="left",
+            wraplength=380,
+        )
+        note.pack(anchor="w", padx=14, pady=(10, 0))
+
+    def _build_advanced_tab(self):
+        frame = self.tab_advanced
+
+        self._label(frame, "Attention backend")
+        ttk.Combobox(
+            frame,
+            textvariable=self.attn_backend_var,
+            values=("flash_attention_2", "sdpa", "eager"),
+            state="readonly",
+        ).pack(fill="x", padx=14, pady=(4, 10))
+
+        adv_card = tk.Frame(frame, bg=self.panel_alt, highlightbackground=self.border, highlightthickness=1)
+        adv_card.pack(fill="x", padx=14, pady=(0, 10))
+
+        self._label_inside(adv_card, "Sampling")
+        tk.Checkbutton(
+            adv_card,
+            text="Use sampling",
+            variable=self.do_sample_var,
+            bg=self.panel_alt,
+            fg=self.text,
+            activebackground=self.panel_alt,
+            activeforeground=self.text,
+            selectcolor=self.card,
+            relief="flat",
+            font=("Segoe UI", 10),
+        ).pack(anchor="w", padx=12, pady=(0, 6))
+
+        self._scale_block(adv_card, "Temperature", self.temperature_var, 0.1, 1.2, 0.05)
+        self._scale_block(adv_card, "Top-p", self.top_p_var, 0.1, 1.0, 0.05)
+        self._scale_block(adv_card, "Top-k", self.top_k_var, 0, 100, 1)
+        self._scale_block(adv_card, "Repetition penalty", self.repetition_penalty_var, 1.0, 1.3, 0.01)
+
+        help_label = tk.Label(
+            frame,
+            text=(
+                "Recommended defaults for memory-constrained CUDA systems:\n"
+                "• flash_attention_2 first, SDPA fallback\n"
+                "• thinking off for normal captioning\n"
+                "• max image side 768\n"
+                "• max new tokens 192 to 256\n"
+                "• batch size 1"
+            ),
+            bg=self.panel,
+            fg=self.muted,
+            font=("Segoe UI", 9),
+            justify="left",
+        )
+        help_label.pack(anchor="w", padx=14, pady=(4, 0))
+
+    def _label(self, parent: tk.Widget, text: str):
+        tk.Label(parent, text=text, bg=self.panel, fg=self.text, font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=14, pady=(12, 0))
+
+    def _label_inside(self, parent: tk.Widget, text: str):
+        tk.Label(parent, text=text, bg=self.panel_alt, fg=self.text, font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=12, pady=(10, 8))
+
+    def _label_inside_small(self, parent: tk.Widget, text: str):
+        tk.Label(parent, text=text, bg=self.panel_alt, fg=self.muted, font=("Segoe UI", 9)).pack(anchor="w", padx=12, pady=(0, 4))
+
+    def _entry(self, parent: tk.Widget, variable: tk.StringVar):
+        entry = tk.Entry(
+            parent,
+            textvariable=variable,
+            bg="#0d1628",
+            fg=self.text,
+            insertbackground=self.text,
+            relief="flat",
+            font=("Segoe UI", 10),
+        )
+        entry.pack(fill="x", padx=14, pady=(4, 10), ipady=7)
+        return entry
+
+    def _path_row(self, parent: tk.Widget, variable: tk.StringVar, browse_cmd):
+        row = tk.Frame(parent, bg=self.panel)
+        row.pack(fill="x", padx=14, pady=(4, 10))
+        entry = tk.Entry(
+            row,
+            textvariable=variable,
+            bg="#0d1628",
+            fg=self.text,
+            insertbackground=self.text,
+            relief="flat",
+            font=("Segoe UI", 10),
+        )
+        entry.pack(side="left", fill="x", expand=True, ipady=7)
+        tk.Button(
+            row,
+            text="Browse",
+            command=browse_cmd,
+            bg="#253655",
+            fg=self.text,
+            activebackground="#31476c",
+            activeforeground=self.text,
+            relief="flat",
+            font=("Segoe UI", 10),
+            padx=12,
+            pady=6,
+        ).pack(side="right", padx=(8, 0))
+        return entry
+
+    def _setup_drag_drop(self):
+        if DND_FILES is None:
+            self._log("Drag and drop disabled. Install tkinterdnd2 to enable it.")
+            return
+
+        registered = 0
+        seen: set[str] = set()
+        targets = [self.root, *self._iter_widgets(self.root)]
+        drop_types = [DND_FILES]
+        if DND_TEXT is not None:
+            drop_types.append(DND_TEXT)
+
+        for target in targets:
+            widget_name = str(target)
+            if widget_name in seen:
+                continue
+            seen.add(widget_name)
+            try:
+                target.drop_target_register(*drop_types)
+                target.dnd_bind("<<Drop>>", self._handle_image_drop)
+                registered += 1
+            except Exception as exc:
+                self._log(f"Could not enable drag and drop for {target}: {exc}")
+
+        if registered:
+            self._log(f"Drag and drop enabled on {registered} UI target(s).")
+
+    def _iter_widgets(self, widget: tk.Widget):
+        for child in widget.winfo_children():
+            yield child
+            yield from self._iter_widgets(child)
+
+    def _handle_image_drop(self, event):
+        image_path = self._first_image_from_drop(event.data)
+        if image_path is None:
+            messagebox.showerror(
+                "Unsupported file",
+                "Drop a supported image file: PNG, JPG, JPEG, WEBP, BMP, TIF, or TIFF.",
+            )
+            return
+
+        self._load_image_path(image_path, "drop")
+
+    def _first_image_from_drop(self, data: str) -> Path | None:
+        raw_paths = self._split_drop_data(data)
+
+        for raw_path in raw_paths:
+            image_path = self._normalize_dropped_path(raw_path)
+            if image_path.is_file() and image_path.suffix.lower() in IMAGE_EXTENSIONS:
+                return image_path
+            if self._is_image_url(raw_path):
+                downloaded = self._download_dropped_image(raw_path)
+                if downloaded is not None:
+                    return downloaded
+        return None
+
+    def _split_drop_data(self, data: str) -> list[str]:
+        stripped = data.strip()
+        if re.match(r"^(?:file|https?)://", stripped, flags=re.IGNORECASE) and "\n" not in stripped:
+            return [stripped]
+
+        try:
+            values = list(self.root.tk.splitlist(data))
+        except tk.TclError:
+            values = [data]
+
+        expanded: list[str] = []
+        for value in values:
+            value = value.strip()
+            if not value:
+                continue
+            if "\n" in value:
+                expanded.extend(part.strip() for part in value.splitlines() if part.strip())
+            else:
+                expanded.append(value)
+        return expanded
+
+    def _normalize_dropped_path(self, raw_path: str) -> Path:
+        value = raw_path.strip().strip("{}").strip()
+        parsed = urlparse(value)
+        if parsed.scheme == "file":
+            value = unquote(parsed.path)
+            value = value.replace("\\", "/")
+            if os.name == "nt" and re.match(r"^/[A-Za-z]:/", value):
+                value = value[1:]
+        return Path(value)
+
+    def _is_image_url(self, value: str) -> bool:
+        value = value.strip().strip("{}").strip()
+        parsed = urlparse(value)
+        if parsed.scheme not in {"http", "https"}:
+            return False
+        suffix = Path(parsed.path).suffix.lower()
+        return suffix in IMAGE_EXTENSIONS or not suffix
+
+    def _download_dropped_image(self, url: str) -> Path | None:
+        if requests is None:
+            self._log("Dropped URL ignored because requests is not installed.")
+            return None
+
+        url = url.strip().strip("{}").strip()
+        try:
+            response = requests.get(url, timeout=15, stream=True)
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "").lower()
+            suffix = Path(urlparse(url).path).suffix.lower()
+            if suffix not in IMAGE_EXTENSIONS:
+                if "png" in content_type:
+                    suffix = ".png"
+                elif "webp" in content_type:
+                    suffix = ".webp"
+                elif "bmp" in content_type:
+                    suffix = ".bmp"
+                elif "tiff" in content_type or "tif" in content_type:
+                    suffix = ".tif"
+                elif "jpeg" in content_type or "jpg" in content_type or "image/" in content_type:
+                    suffix = ".jpg"
+                else:
+                    self._log(f"Dropped URL is not an image: {content_type or url}")
+                    return None
+
+            drop_dir = Path(tempfile.gettempdir()) / "qwen_caption_studio_drops"
+            drop_dir.mkdir(parents=True, exist_ok=True)
+            path = drop_dir / f"dropped_{int(time.time() * 1000)}{suffix}"
+            with path.open("wb") as f:
+                for chunk in response.iter_content(chunk_size=1024 * 256):
+                    if chunk:
+                        f.write(chunk)
+
+            try:
+                Image.open(path).verify()
+            except Exception:
+                path.unlink(missing_ok=True)
+                self._log(f"Downloaded dropped URL but it was not a valid image: {url}")
+                return None
+
+            return path
+        except Exception as exc:
+            self._log(f"Could not download dropped image URL: {type(exc).__name__}: {exc}")
+            return None
+
+    def _scale_block(self, parent: tk.Widget, label: str, variable, from_, to, resolution):
+        block = tk.Frame(parent, bg=parent.cget("bg"))
+        block.pack(fill="x", padx=12, pady=(0, 8))
+        top = tk.Frame(block, bg=parent.cget("bg"))
+        top.pack(fill="x")
+        value_var = tk.StringVar()
+        value_var.set(str(variable.get()))
+        tk.Label(top, text=label, bg=parent.cget("bg"), fg=self.text, font=("Segoe UI", 10)).pack(side="left")
+        tk.Label(top, textvariable=value_var, bg=parent.cget("bg"), fg=self.accent, font=("Segoe UI", 10, "bold")).pack(side="right")
+
+        def on_change(value):
+            f = float(value)
+            if float(resolution).is_integer():
+                value_var.set(str(int(f)))
+            else:
+                value_var.set(f"{f:.2f}")
+            self._update_prompt_detail()
+
+        scale = tk.Scale(
             block,
             from_=from_,
             to=to,
             resolution=resolution,
             orient="horizontal",
             variable=variable,
-            bg=self.panel,
+            bg=parent.cget("bg"),
             fg=self.text,
-            troughcolor="#24324d",
+            troughcolor="#253655",
             highlightthickness=0,
             activebackground=self.accent,
             relief="flat",
-            command=lambda value, label_widget=value_label, kind=label: label_widget.config(text=self._format_slider_value(kind, value)),
+            command=on_change,
         )
-        slider.pack(fill=X, pady=(2, 4))
+        scale.pack(fill="x")
+        on_change(variable.get())
+        variable.trace_add("write", lambda *_args: on_change(variable.get()))
 
-    def _format_slider_value(self, label: str, value: str) -> str:
-        if label == "Top-k" or label == "Output length":
-            return str(int(float(value)))
-        return f"{float(value):.2f}"
+    # ---------- UI Actions ----------
 
-    def _sync_length_label(self, value: str):
-        self.length_value_label.config(text=str(int(float(value))))
-
-    def _choose_image(self):
+    def choose_image(self):
         path = filedialog.askopenfilename(
             title="Choose an image",
-            filetypes=[
-                ("Image files", "*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff"),
-                ("All files", "*.*"),
-            ],
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff"), ("All files", "*.*")],
         )
         if path:
-            self.image_entry._clear_placeholder()
-            self.image_entry.delete(0, END)
-            self.image_entry.insert(0, path)
-            self.image_entry.config(fg=self.text)
-            self._update_preview(path)
-            self._set_current_image(path)
+            self._load_image_path(Path(path), "browse")
 
-    def _choose_save_path(self):
-        default_ext = ".json" if self.save_format_var.get() == "json" else ".txt"
+    def _load_image_path(self, image_path: Path, source: str):
+        self.image_path_var.set(str(image_path))
+        self._update_preview(str(image_path))
+        self.current_item_var.set(f"Current: {image_path.name}")
+        if source == "drop":
+            self._set_status(f"Image loaded from drop: {image_path.name}", self.good)
+        else:
+            self._set_status(f"Image loaded: {image_path.name}", self.good)
+
+    def choose_save_path(self):
+        ext = ".json" if self.save_format_var.get() == "json" else ".txt"
         path = filedialog.asksaveasfilename(
-            title="Save caption as",
-            defaultextension=default_ext,
-            filetypes=[("Text file", "*.txt"), ("JSON file", "*.json")],
+            title="Choose save path",
+            defaultextension=ext,
+            filetypes=[("Text", "*.txt"), ("JSON", "*.json")],
         )
         if path:
-            self.save_entry._clear_placeholder()
-            self.save_entry.delete(0, END)
-            self.save_entry.insert(0, path)
-            self.save_entry.config(fg=self.text)
+            self.save_path_var.set(path)
             suffix = Path(path).suffix.lower().lstrip(".")
             if suffix in {"txt", "json"}:
                 self.save_format_var.set(suffix)
 
-    def _choose_batch_images_folder(self):
-        folder = filedialog.askdirectory(title="Choose a folder with images")
+    def choose_batch_folder(self):
+        folder = filedialog.askdirectory(title="Choose image folder")
         if folder:
-            self.batch_image_folder_entry._clear_placeholder()
-            self.batch_image_folder_entry.delete(0, END)
-            self.batch_image_folder_entry.insert(0, folder)
-            self.batch_image_folder_entry.config(fg=self.text)
+            self.batch_folder_var.set(folder)
 
-    def _choose_batch_save_folder(self):
-        folder = filedialog.askdirectory(title="Choose a folder to save captions")
+    def choose_batch_save_folder(self):
+        folder = filedialog.askdirectory(title="Choose batch save folder")
         if folder:
-            self.batch_save_folder_entry._clear_placeholder()
-            self.batch_save_folder_entry.delete(0, END)
-            self.batch_save_folder_entry.insert(0, folder)
-            self.batch_save_folder_entry.config(fg=self.text)
+            self.batch_save_folder_var.set(folder)
 
-    def _reset_defaults(self):
-        self.model_name_var.set(DEFAULT_MODEL_NAME)
-        self.output_length_var.set(128)
-        self._sync_length_label("128")
-        self.temperature_var.set(0.6)
-        self.top_p_var.set(0.9)
-        self.top_k_var.set(40)
-        self.repetition_var.set(1.05)
-        self.do_sample_var.set(False)
-        self.prompt_text.delete("1.0", END)
-        self.prompt_text.insert("1.0", DEFAULT_PROMPT)
-        self._clear_entry(self.image_entry, DEFAULT_IMAGE_HINT)
-        self._clear_entry(self.hf_token_entry, "hf_...")
-        self._clear_entry(self.save_entry, DEFAULT_SAVE_HINT)
-        self._clear_entry(self.caption_prefix_entry, DEFAULT_CAPTION_PREFIX_HINT)
-        self._clear_entry(self.batch_image_folder_entry, "Choose a folder with images...")
-        self._clear_entry(self.batch_save_folder_entry, "Choose a folder for captions...")
-        self._clear_entry(self.batch_prefix_entry, "Optional, for example: photo")
-        self.caption_prefix_position_var.set("front")
-        if self.batch_mode_var.get():
-            self._toggle_batch_mode()
-        self._clear_preview()
-        self._set_status("Restored default values.")
-
-    def _clear_entry(self, entry: PlaceholderEntry, placeholder: str):
-        entry.delete(0, END)
-        entry.insert(0, placeholder)
-        entry.config(fg=self.muted)
-        entry._has_placeholder = True
-
-    def _clear_output(self):
-        self.output_text.configure(state="normal")
-        self.output_text.delete("1.0", END)
-        self.output_text.insert("1.0", "Ready. Choose an image and click Generate.")
-        self.output_text.configure(state="disabled")
+    def clear_output(self):
+        self._set_output("Ready. Generate a caption to see results.")
         self._set_status("Output cleared.")
 
-    def _set_batch_progress(self, text: str = ""):
-        self.batch_progress_var.set(text)
+    def reset_defaults(self):
+        self.model_name_var.set(DEFAULT_MODEL_NAME)
+        self.hf_token_var.set("")
+        self.image_path_var.set("")
+        self.save_path_var.set("")
+        self.save_format_var.set("txt")
+        self.batch_mode_var.set(False)
+        self.batch_folder_var.set("")
+        self.batch_save_folder_var.set("")
+        self.batch_prefix_var.set("")
+        self.skip_existing_var.set(True)
 
-    def _set_batch_progress_async(self, text: str = ""):
-        self.root.after(0, lambda value=text: self._set_batch_progress(value))
+        self.speed_preset_var.set(DEFAULT_SPEED_PRESET)
+        self.prewarm_var.set(True)
+        self._apply_speed_preset()
+        self.do_sample_var.set(False)
+        self.temperature_var.set(0.3)
+        self.top_p_var.set(0.9)
+        self.top_k_var.set(40)
+        self.repetition_penalty_var.set(1.05)
+        self.attn_backend_var.set(DEFAULT_ATTENTION_BACKEND)
 
-    def _set_current_image(self, text: str):
-        display_text = text.strip() if text.strip() else "none selected"
-        self.current_image_var.set(f"Current image: {display_text}")
+        self.system_prompt_text.delete("1.0", tk.END)
+        self.system_prompt_text.insert("1.0", DEFAULT_SYSTEM_PROMPT)
 
-    def _set_current_image_async(self, text: str):
-        self.root.after(0, lambda value=text: self._set_current_image(value))
+        self.user_prompt_text.delete("1.0", tk.END)
+        self.user_prompt_text.insert("1.0", DEFAULT_USER_PROMPT)
 
-    def _toggle_debug_logs(self):
-        if self.debug_visible.get():
-            self.debug_panel.pack(fill=X, padx=16, pady=(0, 14))
-        else:
-            self.debug_panel.pack_forget()
+        self._clear_preview()
+        self.current_item_var.set("Current: none")
+        self.batch_progress_var.set("")
+        self._set_status("Defaults restored.")
 
-    def _debug_log(self, message: str):
-        if not self.debug_visible.get():
-            return
-
-        def append():
-            self.debug_text.configure(state="normal")
-            self.debug_text.insert(END, message.rstrip() + "\n")
-            self.debug_text.see(END)
-            self.debug_text.configure(state="disabled")
-
-        self.root.after(0, append)
-
-    def _clear_debug_logs(self):
-        def clear():
-            self.debug_text.configure(state="normal")
-            self.debug_text.delete("1.0", END)
-            self.debug_text.configure(state="disabled")
-
-        self.root.after(0, clear)
-
-    def _update_preview_from_entry(self):
-        path = self.image_entry.get_value()
-        if path:
-            self._update_preview(path)
-        else:
-            self._clear_preview()
-
-    def _set_preview_async(self, image_path: str):
-        self.root.after(0, lambda path=image_path: self._update_preview(path))
-
-    def _update_preview(self, image_path: str):
-        try:
-            image_file = Path(image_path)
-            if not image_file.exists():
-                self._clear_preview("Image not found")
-                return
-
-            image = Image.open(image_file).convert("RGB")
-            image.thumbnail((340, 240))
-            self.preview_photo = ImageTk.PhotoImage(image)
-            self.preview_canvas.delete("all")
-            canvas_width = int(self.preview_canvas.cget("width"))
-            canvas_height = int(self.preview_canvas.cget("height"))
-            x_pos = canvas_width // 2
-            y_pos = canvas_height // 2
-            self.preview_canvas.create_image(x_pos, y_pos, image=self.preview_photo, anchor="center")
-        except Exception as exc:
-            self._clear_preview(f"Preview failed\n{exc}")
-
-    def _clear_preview(self, text: str = "No image loaded yet"):
-        self.preview_photo = None
-        if hasattr(self, "preview_canvas"):
-            self.preview_canvas.delete("all")
-            self.preview_canvas.create_text(
-                170,
-                120,
-                text=text,
-                fill=self.muted,
-                font=("Segoe UI", 10),
-                justify="center",
-            )
-
-    def _set_status_async(self, text: str, color: str | None = None):
-        self.root.after(0, lambda value=text, tint=color: self._set_status(value, tint))
-
-    def _build_brand_icon(self, parent: tk.Widget):
-        icon_path = self._icon_path()
-        if icon_path.exists():
-            try:
-                icon_image = Image.open(icon_path).convert("RGBA")
-                try:
-                    resample_filter = Image.Resampling.LANCZOS
-                except AttributeError:
-                    resample_filter = cast(Any, Image).LANCZOS
-                icon_image = icon_image.resize((40, 40), resample_filter)
-                self.brand_icon_photo = ImageTk.PhotoImage(icon_image)
-                tk.Label(parent, image=self.brand_icon_photo, bg=self.bg).pack(side=LEFT)
-                return
-            except Exception:
-                pass
-
-        tk.Label(parent, text="🖼️", bg=self.bg, fg=self.text, font=("Segoe UI", 22, "bold")).pack(side=LEFT)
-
-    def _set_status(self, text: str, color: str | None = None):
-        if color is None:
-            color = self.muted
-        self.status_label.config(text=text, fg=color)
+    # ---------- Output / Status / Logs ----------
 
     def _set_output(self, text: str):
         self.output_text.configure(state="normal")
-        self.output_text.delete("1.0", END)
+        self.output_text.delete("1.0", tk.END)
         self.output_text.insert("1.0", text)
         self.output_text.configure(state="disabled")
 
     def _append_output(self, text: str):
         self.output_text.configure(state="normal")
-        self.output_text.insert(END, text)
-        self.output_text.see(END)
+        self.output_text.insert(tk.END, text)
+        self.output_text.see(tk.END)
         self.output_text.configure(state="disabled")
 
-    def _read_prompt(self) -> str:
-        prompt = self.prompt_text.get("1.0", END).strip()
-        return prompt or DEFAULT_PROMPT
+    def _set_status(self, text: str, color: str | None = None):
+        self.status_label.config(text=text, fg=color or self.muted)
 
-    def _collect_inputs(self):
-        model_name = self.model_name_var.get().strip() or DEFAULT_MODEL_NAME
-        hf_token = self.hf_token_entry.get_value()
-        image_path = self.image_entry.get_value()
-        save_path = self.save_entry.get_value()
-        caption_prefix = self.caption_prefix_entry.get_value()
-        caption_prefix_position = self.caption_prefix_position_var.get().strip().lower() or "front"
-        batch_image_folder = self.batch_image_folder_entry.get_value()
-        batch_save_folder = self.batch_save_folder_entry.get_value()
-        batch_prefix = self.batch_prefix_entry.get_value()
-        prompt = self._read_prompt()
-        max_new_tokens = int(self.output_length_var.get())
-        temperature = float(self.temperature_var.get())
-        top_p = float(self.top_p_var.get())
-        top_k = int(self.top_k_var.get())
-        repetition_penalty = float(self.repetition_var.get())
-        do_sample = bool(self.do_sample_var.get())
-        return {
-            "model_name": model_name,
-            "hf_token": hf_token,
-            "image_path": image_path,
-            "save_path": save_path,
-            "caption_prefix": caption_prefix,
-            "caption_prefix_position": caption_prefix_position,
-            "batch_mode": bool(self.batch_mode_var.get()),
-            "batch_image_folder": batch_image_folder,
-            "batch_save_folder": batch_save_folder,
-            "batch_prefix": batch_prefix,
-            "prompt": prompt,
-            "max_new_tokens": max_new_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-            "top_k": top_k,
-            "repetition_penalty": repetition_penalty,
-            "do_sample": do_sample,
-        }
+    def _log(self, text: str):
+        def inner():
+            self.debug_text.configure(state="normal")
+            self.debug_text.insert(tk.END, text.rstrip() + "\n")
+            self.debug_text.see(tk.END)
+            self.debug_text.configure(state="disabled")
+        self.root.after(0, inner)
 
-    def generate_caption(self):
-        if self.current_worker and self.current_worker.is_alive():
-            messagebox.showinfo("Busy", "Caption generation is already running.")
+    def _clear_logs(self):
+        self.debug_text.configure(state="normal")
+        self.debug_text.delete("1.0", tk.END)
+        self.debug_text.configure(state="disabled")
+
+    # ---------- Preview ----------
+
+    def _update_preview(self, image_path: str):
+        try:
+            image = Image.open(image_path).convert("RGB")
+            image.thumbnail((760, 320))
+            self.preview_photo = ImageTk.PhotoImage(image)
+            self.preview_canvas.delete("all")
+            self.preview_canvas.create_image(380, 160, image=self.preview_photo)
+        except Exception as exc:
+            self._clear_preview(f"Preview failed\n{exc}")
+
+    def _clear_preview(self, text: str = "Drop an image here or use Browse"):
+        self.preview_photo = None
+        self.preview_canvas.delete("all")
+        self.preview_canvas.create_text(
+            380,
+            160,
+            text=text,
+            fill=self.muted,
+            font=("Segoe UI", 12),
+            justify="center",
+        )
+
+    # ---------- Monitoring / Timer ----------
+
+    def _update_system_info(self):
+        self.cpu_var.set(get_cpu_text())
+        self.ram_var.set(get_cpu_ram_text())
+        self.gpu_var.set(get_gpu_text())
+        self.cpu_temp_var.set(get_cpu_temp_text())
+        self.gpu_temp_var.set(get_gpu_temp_text())
+        self.root.after(1000, self._update_system_info)
+
+    def _start_timer(self):
+        self.timer_running = True
+        self.timer_start = time.perf_counter()
+        self._update_timer()
+
+    def _update_timer(self):
+        if not self.timer_running:
+            return
+        elapsed = format_seconds(time.perf_counter() - self.timer_start)
+        self.timer_var.set(f"Elapsed: {elapsed}")
+        self.timer_job = self.root.after(250, self._update_timer)
+
+    def _stop_timer(self):
+        if self.timer_job:
+            try:
+                self.root.after_cancel(self.timer_job)
+            except Exception:
+                pass
+            self.timer_job = None
+
+        if self.timer_running:
+            elapsed = time.perf_counter() - self.timer_start
+            self.last_elapsed = format_seconds(elapsed)
+
+        self.timer_running = False
+        self.timer_var.set(f"Elapsed: {self.last_elapsed}")
+
+    # ---------- Model Handling ----------
+
+    def load_model_async(self):
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo("Busy", "A job is already running.")
             return
 
         self.stop_requested.clear()
-        payload = self._collect_inputs()
-        if payload["batch_mode"]:
-            if not payload["batch_image_folder"]:
-                messagebox.showerror("Missing folder", "Please choose a folder of images first.")
-                return
-            image_folder = Path(payload["batch_image_folder"])
-            if not image_folder.exists() or not image_folder.is_dir():
-                messagebox.showerror("Folder not found", f"The selected images folder does not exist:\n{image_folder}")
-                return
-            if not payload["batch_save_folder"]:
-                messagebox.showerror("Missing save folder", "Please choose a folder to save the captions.")
-                return
-        else:
-            if not payload["image_path"]:
-                messagebox.showerror("Missing image", "Please choose an image file first.")
-                return
+        self.worker = threading.Thread(target=self._worker_load_model, daemon=True)
+        self.worker.start()
 
-            image_file = Path(payload["image_path"])
-            if not image_file.exists():
-                messagebox.showerror("Image not found", f"The selected image does not exist:\n{image_file}")
-                return
-
-        self.generate_button.config(state="disabled")
-        self.stop_button.config(state="normal")
-        self._set_status("Loading model and generating caption...", self.accent)
-        self._set_batch_progress("")
-        if payload["batch_mode"]:
-            self._set_current_image(payload["batch_image_folder"])
-        else:
-            self._set_current_image(payload["image_path"])
-        start_message = "Starting batch generation..." if payload["batch_mode"] else "Starting generation..."
-        self._append_output(f"\n\n---\n{start_message}\n")
-        self._clear_debug_logs()
-        self._debug_log("--- generation started ---")
-        self._debug_log(f"model: {payload['model_name']}")
-        if payload["batch_mode"]:
-            self._debug_log(f"batch folder: {payload['batch_image_folder']}")
-            self._debug_log(f"save folder: {payload['batch_save_folder']}")
-            self._debug_log(f"prefix: {payload['batch_prefix'] or '(none)'}")
-        else:
-            self._debug_log(f"image: {payload['image_path']}")
-        self._debug_log(f"max_new_tokens: {payload['max_new_tokens']}")
-        self._debug_log(f"do_sample: {payload['do_sample']}")
-
-        self.current_worker = threading.Thread(target=self._worker_generate, args=(payload,), daemon=True)
-        self.current_worker.start()
-
-    def stop_captioning(self):
-        if not self.current_worker or not self.current_worker.is_alive():
-            messagebox.showinfo("Nothing running", "No captioning job is currently running.")
-            return
-        self.stop_requested.set()
-        self._debug_log("stop requested by user")
-        self._set_status("Stop requested. Finishing current step...", self.accent2)
-
-    def _worker_generate(self, payload: dict):
+    def _worker_load_model(self):
         try:
-            self._debug_log("loading processor and model")
-            processor, model, device = self._load_model(payload["model_name"], payload["hf_token"])
-            self._debug_log(f"using device: {device}")
-            if payload["batch_mode"]:
-                result_text, summary, stopped = self._generate_batch_captions(payload, processor, model, device)
-                self._debug_log(summary)
-                if stopped:
-                    self.root.after(0, lambda: self._finish_stopped(result_text, "Batch captioning stopped."))
-                else:
-                    self.root.after(0, lambda: self._finish_success(result_text, "Batch caption generation completed successfully."))
-            else:
-                caption = self._generate_single_caption(payload["image_path"], payload, processor, model, device)
-                if not caption:
-                    caption = "(No caption was generated.)"
-
-                caption = self._apply_caption_prefix(caption, payload["caption_prefix"], payload["caption_prefix_position"])
-
-                save_message = self._maybe_save_caption(payload, caption)
-                result_text = f"Caption:\n{caption}"
-                if save_message:
-                    result_text += f"\n\n{save_message}"
-                self._debug_log("caption ready")
-
-                if self.stop_requested.is_set():
-                    self.root.after(0, lambda: self._finish_stopped(result_text))
-                else:
-                    self.root.after(0, lambda: self._finish_success(result_text))
+            self.root.after(0, lambda: self._set_status("Loading model...", self.accent))
+            self._load_model()
+            self.root.after(0, lambda: self._set_status("Model loaded successfully.", self.good))
         except Exception as exc:
-            self._debug_log(f"error: {type(exc).__name__}: {exc}")
-            error_text = f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}"
-            self.root.after(0, lambda: self._finish_error(error_text))
-
-    def _generate_single_caption(self, image_path: str, payload: dict, processor: Any, model: Any, device: str) -> str:
-        self.root.after(0, self._start_caption_timer)
-        image = Image.open(image_path).convert("RGB")
-        self._debug_log(f"opened image: {image_path}")
-        try:
-            caption = self._run_caption_pipeline(payload, processor, model, device, image)
+            err = f"{type(exc).__name__}: {exc}"
+            self._log(traceback.format_exc())
+            self.root.after(0, lambda: self._set_status(err, self.bad))
+            self.root.after(0, lambda: messagebox.showerror("Model load failed", err))
         finally:
-            self.root.after(0, lambda: self._stop_caption_timer(keep_elapsed=True))
-        return caption
+            self.worker = None
 
-    def _run_caption_pipeline(self, payload: dict, processor: Any, model: Any, device: str, image: Image.Image) -> str:
-        convo = [
-            {
-                "role": "system",
-                "content": "You are a helpful image captioner that writes clear, detailed descriptions.",
-            },
-            {
-                "role": "user",
-                "content": payload["prompt"],
-            },
-        ]
+    def _load_model(self):
+        model_name = self.model_name_var.get().strip() or DEFAULT_MODEL_NAME
+        hf_token = self.hf_token_var.get().strip()
+        requested_attn_backend = self.attn_backend_var.get().strip() or DEFAULT_ATTENTION_BACKEND
+        resolved_attn_backend = self._resolve_attention_backend(requested_attn_backend)
 
-        convo_string = processor.apply_chat_template(convo, tokenize=False, add_generation_prompt=True)
-        inputs = processor(text=[convo_string], images=[image], return_tensors="pt")
-        inputs = inputs.to(device)
-        self._debug_log("prepared model inputs")
+        if (
+            self.model is not None
+            and self.processor is not None
+            and self.loaded_model_name == model_name
+            and self.loaded_attn_backend == resolved_attn_backend
+        ):
+            self._log("Model already loaded. Reusing current model.")
+            return
 
-        pixel_dtype = torch.float16 if device == "cuda" else torch.float32
-        if "pixel_values" in inputs:
-            inputs["pixel_values"] = inputs["pixel_values"].to(pixel_dtype)
+        self.unload_model(silent=True)
 
-        max_new_tokens = max(1, int(payload["max_new_tokens"]))
-        generation_kwargs = {
-            "max_new_tokens": max_new_tokens,
-            "do_sample": payload["do_sample"],
-            "use_cache": True,
-            "repetition_penalty": payload["repetition_penalty"],
-            "top_p": payload["top_p"],
-            "top_k": payload["top_k"],
-            "temperature": payload["temperature"],
-            "stopping_criteria": StoppingCriteriaList([StopGenerationCriteria(self.stop_requested)]),
+        torch_dtype = pick_torch_dtype()
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        loader_cls = get_model_loader_class()
+
+        self._log(f"Loading model: {model_name}")
+        self._log(f"Loader class: {loader_cls.__name__}")
+        self._log(f"Device: {device}")
+        self._log(f"Dtype: {torch_dtype}")
+        self._log(f"Requested attention backend: {requested_attn_backend}")
+        self._log(f"Resolved attention backend: {resolved_attn_backend}")
+        self._log(f"Speed preset: {self.speed_preset_var.get()}")
+
+        token_kw = {"token": hf_token} if hf_token else {}
+
+        self.processor = AutoProcessor.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            **token_kw,
+        )
+
+        backend_attempts = [resolved_attn_backend]
+        if requested_attn_backend == "flash_attention_2" and resolved_attn_backend == "flash_attention_2":
+            backend_attempts.append("sdpa")
+
+        last_error: Exception | None = None
+        for backend in backend_attempts:
+            try:
+                load_kwargs = self._build_model_load_kwargs(backend, token_kw, torch_dtype, device)
+                self._log(f"Trying attention backend: {backend}")
+                self.model = loader_cls.from_pretrained(model_name, **load_kwargs)
+                resolved_attn_backend = backend
+                break
+            except Exception as exc:
+                last_error = exc
+                if backend == "flash_attention_2" and "sdpa" in backend_attempts:
+                    self._log(f"FlashAttention load failed; retrying with SDPA. {type(exc).__name__}: {exc}")
+                    self.model = None
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        try:
+                            torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+                    continue
+                raise
+
+        if self.model is None:
+            raise RuntimeError(f"Model load failed: {last_error}")
+
+        self.model.eval()
+
+        self.loaded_model_name = model_name
+        self.loaded_device = device
+        self.loaded_dtype = torch_dtype
+        self.loaded_attn_backend = resolved_attn_backend
+
+        if self.prewarm_var.get():
+            self._prewarm_model()
+
+        state = f"Model: loaded on {device} | {resolved_attn_backend} | {self.speed_preset_var.get()}"
+        self.root.after(0, lambda: self.model_state_var.set(state))
+
+    def _build_model_load_kwargs(
+        self,
+        attn_backend: str,
+        token_kw: dict[str, str],
+        torch_dtype: torch.dtype,
+        device: str,
+    ) -> dict[str, Any]:
+        load_kwargs: dict[str, Any] = {
+            "trust_remote_code": True,
+            "attn_implementation": attn_backend,
+            **token_kw,
         }
 
-        with torch.inference_mode():
-            self._debug_log("starting generation")
-            generate_ids = model.generate(**inputs, **generation_kwargs)[0]
-        self._debug_log("generation completed")
+        if device == "cuda":
+            total_gb = 16
+            if psutil is not None:
+                try:
+                    total_gb = max(8, int(psutil.virtual_memory().total / (1024**3)))
+                except Exception:
+                    total_gb = 16
 
-        prompt_length = inputs["input_ids"].shape[1]
-        caption_ids = generate_ids[prompt_length:]
-        caption = processor.tokenizer.decode(
-            caption_ids,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        ).strip()
-        return caption
+            cpu_budget = max(8, total_gb - 4)
+            load_kwargs.update(
+                {
+                    "device_map": "auto",
+                    "max_memory": {0: "3.4GiB", "cpu": f"{cpu_budget}GiB"},
+                    "torch_dtype": torch_dtype,
+                }
+            )
+        else:
+            load_kwargs.update({"torch_dtype": torch.float32})
 
-    def _generate_batch_captions(self, payload: dict, processor: Any, model: Any, device: str) -> tuple[str, str, bool]:
-        folder = Path(payload["batch_image_folder"])
+        return load_kwargs
+
+    def _resolve_attention_backend(self, requested: str, log: bool = True) -> str:
+        requested = requested or DEFAULT_ATTENTION_BACKEND
+        if requested == "flash_attention_2":
+            if not torch.cuda.is_available():
+                if log:
+                    self._log("FlashAttention requires CUDA. Falling back to SDPA.")
+                return "sdpa"
+            if importlib.util.find_spec("flash_attn") is None:
+                if log:
+                    self._log("flash_attn is not importable. Falling back to SDPA.")
+                return "sdpa"
+            return "flash_attention_2"
+        if requested in {"sdpa", "eager"}:
+            return requested
+        if log:
+            self._log(f"Unknown attention backend '{requested}'. Falling back to SDPA.")
+        return "sdpa"
+
+    def _prewarm_model(self):
+        if self.processor is None or self.model is None:
+            return
+
+        start = time.perf_counter()
+        self._log("Prewarming model...")
+        payload = {
+            "system_prompt": "You are a concise visual captioning engine.",
+            "user_prompt": "Describe this image in one short phrase.",
+            "enable_thinking": False,
+            "max_new_tokens": 8,
+            "max_image_side": 64,
+            "do_sample": False,
+            "temperature": 0.3,
+            "top_p": 0.9,
+            "top_k": 40,
+            "repetition_penalty": 1.05,
+        }
+        image = Image.new("RGB", (64, 64), "#101a2d")
+        try:
+            self._caption_image_object(image, payload, log_details=False)
+            elapsed = time.perf_counter() - start
+            self._log(f"Prewarm completed in {elapsed:.2f}s.")
+        except Exception as exc:
+            self._log(f"Prewarm skipped after error: {type(exc).__name__}: {exc}")
+
+    def unload_model(self, silent: bool = False):
+        try:
+            if self.model is not None:
+                del self.model
+            if self.processor is not None:
+                del self.processor
+        except Exception:
+            pass
+
+        self.model = None
+        self.processor = None
+        self.loaded_model_name = None
+        self.loaded_device = None
+        self.loaded_dtype = None
+        self.loaded_attn_backend = None
+
+        gc.collect()
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+
+        self.model_state_var.set("Model: not loaded")
+        if not silent:
+            self._set_status("Model unloaded.", self.muted)
+            self._log("Model unloaded and CUDA cache cleared.")
+
+    # ---------- Generation Control ----------
+
+    def request_stop(self):
+        if not self.worker or not self.worker.is_alive():
+            self._set_status("No active job to stop.", self.warn)
+            return
+        self.stop_requested.set()
+        self._set_status("Stop requested. Waiting for the current step to end...", self.warn)
+        self._log("Stop requested by user.")
+
+    def generate_async(self):
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo("Busy", "A job is already running.")
+            return
+
+        payload = self._collect_payload()
+        error = self._validate_payload(payload)
+        if error:
+            messagebox.showerror("Input error", error)
+            return
+
+        self.stop_requested.clear()
+        self._clear_logs()
+        self._append_output("\n\n---\nStarting...\n")
+        self.generate_button.config(state="disabled")
+        self.stop_button.config(state="normal")
+
+        self.worker = threading.Thread(target=self._worker_generate, args=(payload,), daemon=True)
+        self.worker.start()
+
+    def _collect_payload(self) -> dict[str, Any]:
+        return {
+            "model_name": self.model_name_var.get().strip() or DEFAULT_MODEL_NAME,
+            "hf_token": self.hf_token_var.get().strip(),
+            "image_path": self.image_path_var.get().strip(),
+            "save_path": self.save_path_var.get().strip(),
+            "save_format": self.save_format_var.get().strip(),
+
+            "batch_mode": bool(self.batch_mode_var.get()),
+            "batch_folder": self.batch_folder_var.get().strip(),
+            "batch_save_folder": self.batch_save_folder_var.get().strip(),
+            "batch_prefix": self.batch_prefix_var.get().strip(),
+            "skip_existing": bool(self.skip_existing_var.get()),
+
+            "system_prompt": self.system_prompt_text.get("1.0", tk.END).strip() or DEFAULT_SYSTEM_PROMPT,
+            "user_prompt": self.user_prompt_text.get("1.0", tk.END).strip() or DEFAULT_USER_PROMPT,
+
+            "enable_thinking": bool(self.enable_thinking_var.get()),
+            "speed_preset": self.speed_preset_var.get().strip() or DEFAULT_SPEED_PRESET,
+            "prewarm": bool(self.prewarm_var.get()),
+            "max_new_tokens": int(self.max_new_tokens_var.get()),
+            "max_image_side": int(self.max_image_side_var.get()),
+
+            "do_sample": bool(self.do_sample_var.get()),
+            "temperature": float(self.temperature_var.get()),
+            "top_p": float(self.top_p_var.get()),
+            "top_k": int(self.top_k_var.get()),
+            "repetition_penalty": float(self.repetition_penalty_var.get()),
+            "attn_backend": self.attn_backend_var.get().strip() or "sdpa",
+        }
+
+    def _validate_payload(self, payload: dict[str, Any]) -> str:
+        if payload["batch_mode"]:
+            if not payload["batch_folder"]:
+                return "Choose a batch image folder."
+            if not Path(payload["batch_folder"]).is_dir():
+                return "The batch image folder does not exist."
+            if not payload["batch_save_folder"]:
+                return "Choose a batch save folder."
+        else:
+            if not payload["image_path"]:
+                return "Choose an image file."
+            if not Path(payload["image_path"]).exists():
+                return "The selected image file does not exist."
+        return ""
+
+    def _worker_generate(self, payload: dict[str, Any]):
+        try:
+            self._log("--- generation started ---")
+            self._log(f"Payload model: {payload['model_name']}")
+            self._log(f"Speed preset: {payload['speed_preset']}")
+            self._log(f"Thinking: {payload['enable_thinking']}")
+            self._log(f"Max tokens: {payload['max_new_tokens']}")
+            self._log(f"Max image side: {payload['max_image_side']}")
+            self._log(f"Requested attention backend: {payload['attn_backend']}")
+            self._log(f"Batch mode: {payload['batch_mode']}")
+
+            self.root.after(0, self._start_timer)
+            self.root.after(0, lambda: self._set_status("Preparing model and inputs...", self.accent))
+
+            self._load_model()
+
+            if payload["batch_mode"]:
+                result = self._run_batch(payload)
+                if self.stop_requested.is_set():
+                    self.root.after(0, lambda: self._finish_job(result, "Batch stopped.", self.warn))
+                else:
+                    self.root.after(0, lambda: self._finish_job(result, "Batch completed successfully.", self.good))
+            else:
+                self.root.after(0, lambda: self.current_item_var.set(f"Current: {Path(payload['image_path']).name}"))
+                self.root.after(0, lambda p=payload["image_path"]: self._update_preview(p))
+                caption = self._caption_one_image(Path(payload["image_path"]), payload)
+                saved_info = self._save_single_output(payload, caption)
+                final_text = f"Caption:\n{caption}"
+                if saved_info:
+                    final_text += f"\n\n{saved_info}"
+                if self.stop_requested.is_set():
+                    self.root.after(0, lambda: self._finish_job(final_text, "Generation stopped.", self.warn))
+                else:
+                    self.root.after(0, lambda: self._finish_job(final_text, "Caption generated successfully.", self.good))
+
+        except Exception as exc:
+            error_text = f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}"
+            self._log(error_text)
+            self.root.after(0, lambda: self._finish_error(error_text))
+        finally:
+            self.worker = None
+
+    def _run_batch(self, payload: dict[str, Any]) -> str:
+        folder = Path(payload["batch_folder"])
         save_folder = Path(payload["batch_save_folder"])
         save_folder.mkdir(parents=True, exist_ok=True)
 
-        image_files = sorted(
-            [
-                path
-                for path in folder.iterdir()
-                if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
-            ]
-        )
-        if not image_files:
-            raise ValueError(f"No supported image files were found in: {folder}")
+        files = sorted([p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS])
+        if not files:
+            raise ValueError("No supported image files found in the selected batch folder.")
 
-        resume_path = self._batch_resume_path(save_folder)
-        config_signature = self._batch_config_signature(payload, folder, save_folder, image_files)
-        resume_state = self._load_batch_resume_state(resume_path)
-        completed_files: set[str] = set()
-
-        if resume_state.get("config_signature") == config_signature:
-            completed_files.update(str(name) for name in resume_state.get("completed_files", []))
-            if completed_files:
-                self._debug_log(f"resuming batch with {len(completed_files)} completed image(s)")
-        elif resume_state:
-            self._debug_log("existing batch resume data ignored because configuration changed")
-
-        completed_files.update(
-            image_file.name
-            for image_file in image_files
-            if self._batch_output_path(payload, image_file, save_folder).exists()
-        )
-
-        pending_files = [image_file for image_file in image_files if image_file.name not in completed_files]
-        skipped_count = len(image_files) - len(pending_files)
-
-        if not pending_files:
-            summary = f"Nothing to do. {len(image_files)} image(s) already captioned."
-            self._set_batch_progress_async(summary)
-            self._set_current_image_async("already completed")
-            return summary, summary, False
-
-        batch_start = time.perf_counter()
         lines = [
-            f"Batch mode: {len(image_files)} image(s)",
-            f"Images folder: {folder}",
+            f"Batch mode: {len(files)} image(s)",
+            f"Source folder: {folder}",
             f"Save folder: {save_folder}",
-            f"Already completed: {skipped_count}",
             "",
         ]
-        total_generation_time = 0.0
-        stopped = False
-        estimated_total_text = "Estimated total: calculating..."
 
-        self._set_batch_progress_async(f"Batch progress: 0/{len(pending_files)} | {estimated_total_text}")
-        if skipped_count:
-            self._set_status_async(f"Resuming batch: {skipped_count} image(s) already completed.", self.accent2)
+        processed = 0
+        skipped = 0
+        started = time.perf_counter()
 
-        for index, image_file in enumerate(pending_files, start=1):
+        for idx, image_path in enumerate(files, start=1):
             if self.stop_requested.is_set():
-                stopped = True
-                self._debug_log("batch stop detected before next image")
-                self._set_batch_progress_async(f"Batch progress: {index - 1}/{len(pending_files)} | Stopped")
                 break
 
-            image_start = time.perf_counter()
-            self._debug_log(f"processing {index}/{len(pending_files)}: {image_file.name}")
-            self._set_preview_async(str(image_file))
-            self._set_status_async(f"Processing {index}/{len(pending_files)}: {image_file.name}", self.accent)
-            self._set_batch_progress_async(f"Batch progress: {index}/{len(pending_files)} | {image_file.name}")
-            self._set_current_image_async(f"{index}/{len(pending_files)} - {image_file.name}")
-            caption = self._generate_single_caption(str(image_file), payload, processor, model, device)
-            if not caption:
-                caption = "(No caption was generated.)"
+            save_path = self._batch_output_path(payload, image_path, save_folder)
+            if payload["skip_existing"] and save_path.exists():
+                skipped += 1
+                self.root.after(0, lambda n=image_path.name, i=idx, total=len(files): self.batch_progress_var.set(f"{i}/{total} Skipped: {n}"))
+                lines.append(f"[{idx}/{len(files)}] Skipped existing: {image_path.name}")
+                continue
 
-            caption = self._apply_caption_prefix(caption, payload["caption_prefix"], payload["caption_prefix_position"])
+            self.root.after(0, lambda p=str(image_path): self._update_preview(p))
+            self.root.after(0, lambda n=image_path.name: self.current_item_var.set(f"Current: {n}"))
+            self.root.after(0, lambda n=image_path.name, i=idx, total=len(files): self.batch_progress_var.set(f"{i}/{total} Processing: {n}"))
+            self.root.after(0, lambda n=image_path.name, i=idx, total=len(files): self._set_status(f"Processing {i}/{total}: {n}", self.accent))
 
-            save_path = self._save_batch_caption(payload, image_file, caption, save_folder)
-            elapsed = time.perf_counter() - image_start
-            total_generation_time += elapsed
+            img_start = time.perf_counter()
+            caption = self._caption_one_image(image_path, payload)
+            self._save_batch_output(payload, image_path, caption, save_folder)
+            elapsed = time.perf_counter() - img_start
 
-            if index == 1:
-                estimated_total_seconds = elapsed * len(pending_files)
-            else:
-                average_seconds = total_generation_time / index
-                estimated_total_seconds = average_seconds * len(pending_files)
-
-            estimated_total_text = f"Estimated total: {self._format_elapsed(estimated_total_seconds).replace('⏱ ', '')}"
-            self._set_batch_progress_async(f"Batch progress: {index}/{len(pending_files)} | {image_file.name} | {estimated_total_text}")
-
-            lines.append(f"[{index}/{len(pending_files)}] {image_file.name} - {elapsed:.2f}s")
+            processed += 1
+            lines.append(f"[{idx}/{len(files)}] {image_path.name} ({elapsed:.2f}s)")
             lines.append(caption)
-            if save_path:
-                lines.append(f"Saved to: {save_path}")
             lines.append("")
-            self._debug_log(f"finished {image_file.name} in {elapsed:.2f}s")
-            self._set_status_async(f"Finished {index}/{len(pending_files)}: {image_file.name} | {estimated_total_text}", self.good)
 
-            completed_files.add(image_file.name)
-            self._write_batch_resume_state(
-                resume_path,
-                {
-                    "config_signature": config_signature,
-                    "folder": str(folder),
-                    "save_folder": str(save_folder),
-                    "image_files": [path.name for path in image_files],
-                    "completed_files": sorted(completed_files),
-                    "last_completed": image_file.name,
-                    "updated_at": time.time(),
-                },
-            )
+        total_elapsed = time.perf_counter() - started
+        lines.append(f"Processed: {processed}")
+        lines.append(f"Skipped: {skipped}")
+        lines.append(f"Total time: {format_seconds(total_elapsed)}")
+        return "\n".join(lines).strip()
 
-            if self.stop_requested.is_set():
-                stopped = True
-                self._debug_log("batch stop detected after current image")
-                self._set_batch_progress_async(f"Batch progress: {index}/{len(pending_files)} | Stopped")
-                break
+    def _caption_one_image(self, image_path: Path, payload: dict[str, Any]) -> str:
+        if self.processor is None or self.model is None:
+            raise RuntimeError("Model is not loaded.")
 
-        total_elapsed = time.perf_counter() - batch_start
-        average_elapsed = total_generation_time / max(1, len(pending_files))
-        summary = f"Total time: {total_elapsed:.2f}s | Average per processed image: {average_elapsed:.2f}s"
-        if stopped:
-            summary = f"Stopped. {summary}"
-        lines.append(summary)
-        self._set_batch_progress_async(summary)
-        if stopped:
-            self._set_current_image_async("stopped")
+        image = Image.open(image_path).convert("RGB")
+        image = resize_image_for_vram(image, payload["max_image_side"])
+        self._log(f"Opened image: {image_path}")
+        self._log(f"Resized image to: {image.size}")
+        return self._caption_image_object(image, payload)
+
+    def _caption_image_object(self, image: Image.Image, payload: dict[str, Any], log_details: bool = True) -> str:
+        messages = [
+            {
+                "role": "system",
+                "content": payload["system_prompt"],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": payload["user_prompt"]},
+                ],
+            },
+        ]
+
+        chat_text = self._build_chat_text(messages, payload["enable_thinking"])
+        if log_details:
+            self._log("Chat template built.")
+
+        if process_vision_info is not None:
+            image_inputs, video_inputs = process_vision_info(messages)
+            processor_kwargs = {
+                "text": [chat_text],
+                "images": image_inputs,
+                "padding": True,
+                "return_tensors": "pt",
+            }
+            if video_inputs is not None:
+                processor_kwargs["videos"] = video_inputs
+            inputs = self.processor(**processor_kwargs)
         else:
-            try:
-                resume_path.unlink()
-            except Exception:
-                pass
-        return "\n".join(lines).strip(), summary, stopped
-
-    def _load_model(self, model_name: str, hf_token: str = "") -> tuple[Any, Any, str]:
-        cache_key = (model_name, hf_token)
-        if cache_key in self.model_cache:
-            self._debug_log("model cache hit")
-            return self.model_cache[cache_key]
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        dtype = torch.float16 if device == "cuda" else torch.float32
-
-        def announce(text: str):
-            self.root.after(0, lambda: self._set_status(text, self.accent))
-
-        announce(f"Loading {model_name} on {device}...")
-        self._debug_log(f"loading model: {model_name}")
-        load_kwargs: dict[str, Any] = {}
-        token = hf_token.strip()
-        if token:
-            load_kwargs["token"] = token
-
-        processor: Any = AutoProcessor.from_pretrained(model_name, **load_kwargs)
-
-        if device == "cuda":
-            model: Any = LlavaForConditionalGeneration.from_pretrained(
-                model_name,
-                dtype=dtype,
-                device_map="auto",
-                **load_kwargs,
+            if log_details:
+                self._log("qwen_vl_utils not found. Falling back to direct processor image input.")
+            inputs = self.processor(
+                text=[chat_text],
+                images=[image],
+                padding=True,
+                return_tensors="pt",
             )
-        else:
-            model = LlavaForConditionalGeneration.from_pretrained(
-                model_name,
-                dtype=dtype,
-                **load_kwargs,
-            )
-            model.to(torch.device(device))
 
-        model.eval()
-        cached = (processor, model, device)
-        self.model_cache[cache_key] = cached
-        self._debug_log("model loaded and cached")
-        return cached
+        target_device = self._pick_input_device()
+        inputs = {k: v.to(target_device) if hasattr(v, "to") else v for k, v in inputs.items()}
 
-    def _clean_filename_component(self, value: str) -> str:
-        cleaned = re.sub(r'[<>:"/\\|?*]+', "_", value.strip())
-        cleaned = cleaned.replace(" ", "_")
-        return cleaned.strip("._ ")
-
-    def _batch_output_path(self, payload: dict, image_file: Path, save_folder: Path) -> Path:
-        prefix = self._clean_filename_component(payload.get("batch_prefix", ""))
-        base_name = image_file.stem if not prefix else f"{prefix}_{image_file.stem}"
-        extension = ".json" if self.save_format_var.get() == "json" else ".txt"
-        return save_folder / f"{base_name}{extension}"
-
-    def _batch_resume_path(self, save_folder: Path) -> Path:
-        return save_folder / ".caption_generator_resume.json"
-
-    def _batch_config_signature(self, payload: dict, folder: Path, save_folder: Path, image_files: list[Path]) -> str:
-        signature_payload = {
-            "model_name": payload["model_name"],
-            "prompt": payload["prompt"],
-            "caption_prefix": payload["caption_prefix"],
-            "caption_prefix_position": payload["caption_prefix_position"],
-            "batch_prefix": payload["batch_prefix"],
-            "save_format": self.save_format_var.get(),
-            "max_new_tokens": payload["max_new_tokens"],
-            "temperature": payload["temperature"],
-            "top_p": payload["top_p"],
-            "top_k": payload["top_k"],
-            "repetition_penalty": payload["repetition_penalty"],
-            "do_sample": payload["do_sample"],
-            "folder": str(folder.resolve()),
-            "save_folder": str(save_folder.resolve()),
-            "images": [path.name for path in image_files],
+        gen_kwargs: dict[str, Any] = {
+            "max_new_tokens": max(1, int(payload["max_new_tokens"])),
+            "do_sample": bool(payload["do_sample"]),
+            "use_cache": True,
+            "repetition_penalty": float(payload["repetition_penalty"]),
+            "stopping_criteria": StoppingCriteriaList([StopGenerationCriteria(self.stop_requested)]),
         }
-        digest = json.dumps(signature_payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
-        return hashlib.sha256(digest).hexdigest()
 
-    def _load_batch_resume_state(self, resume_path: Path) -> dict[str, Any]:
-        if not resume_path.exists():
-            return {}
-        try:
-            return json.loads(resume_path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
+        tokenizer = getattr(self.processor, "tokenizer", None)
+        if tokenizer is not None:
+            pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+            eos_token_id = tokenizer.eos_token_id
+            if pad_token_id is not None:
+                gen_kwargs["pad_token_id"] = pad_token_id
+            if eos_token_id is not None:
+                gen_kwargs["eos_token_id"] = eos_token_id
 
-    def _write_batch_resume_state(self, resume_path: Path, state: dict[str, Any]):
-        try:
-            resume_path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
-        except Exception:
-            self._debug_log("failed to update batch resume state")
+        if payload["do_sample"]:
+            gen_kwargs["temperature"] = float(payload["temperature"])
+            gen_kwargs["top_p"] = float(payload["top_p"])
+            gen_kwargs["top_k"] = int(payload["top_k"])
 
-    def _apply_caption_prefix(self, caption: str, prefix: str, position: str) -> str:
-        caption = caption.strip()
-        prefix = prefix.strip()
-        if not prefix:
-            return caption
+        if log_details:
+            self._log(f"Generation kwargs: {gen_kwargs}")
+
+        with torch.inference_mode():
+            output_ids = self.model.generate(**inputs, **gen_kwargs)
+
+        prompt_len = inputs["input_ids"].shape[1]
+        new_ids = output_ids[:, prompt_len:]
+
+        if tokenizer is None:
+            raise RuntimeError("Processor tokenizer not available.")
+
+        caption = tokenizer.batch_decode(
+            new_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )[0].strip()
+
+        caption = extract_final_answer(caption)
+        caption = re.sub(r"\s+", " ", caption).strip()
+
         if not caption:
-            return prefix
-        if position == "last":
-            return f"{caption}, {prefix}"
-        return f"{prefix}, {caption}"
+            caption = "(No caption was generated.)"
 
-    def _maybe_save_caption(self, payload: dict, caption: str) -> str:
+        if log_details:
+            self._log("Caption generated.")
+        return caption
+
+    def _build_chat_text(self, messages: list[dict[str, Any]], enable_thinking: bool) -> str:
+        try:
+            return self.processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+        except TypeError:
+            self._log("Processor apply_chat_template does not accept enable_thinking. Retrying without it.")
+            return self.processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
+    def _pick_input_device(self) -> torch.device:
+        if torch.cuda.is_available():
+            return torch.device("cuda:0")
+        return torch.device("cpu")
+
+    # ---------- Save helpers ----------
+
+    def _save_single_output(self, payload: dict[str, Any], caption: str) -> str:
         save_path = payload["save_path"]
         if not save_path:
             return ""
@@ -1591,84 +1810,111 @@ class CaptionGeneratorApp:
         path = Path(save_path)
         suffix = path.suffix.lower()
         if suffix not in {".txt", ".json"}:
-            suffix = ".json" if self.save_format_var.get() == "json" else ".txt"
+            suffix = ".json" if payload["save_format"] == "json" else ".txt"
             path = path.with_suffix(suffix)
 
         path.parent.mkdir(parents=True, exist_ok=True)
+
         if path.suffix.lower() == ".json":
             data = {
                 "model_name": payload["model_name"],
                 "image_path": payload["image_path"],
-                "prompt": payload["prompt"],
+                "system_prompt": payload["system_prompt"],
+                "user_prompt": payload["user_prompt"],
+                "enable_thinking": payload["enable_thinking"],
+                "speed_preset": payload.get("speed_preset", DEFAULT_SPEED_PRESET),
                 "caption": caption,
                 "generation": {
                     "max_new_tokens": payload["max_new_tokens"],
+                    "max_image_side": payload["max_image_side"],
+                    "do_sample": payload["do_sample"],
                     "temperature": payload["temperature"],
                     "top_p": payload["top_p"],
                     "top_k": payload["top_k"],
                     "repetition_penalty": payload["repetition_penalty"],
-                    "do_sample": payload["do_sample"],
+                    "requested_attn_backend": payload["attn_backend"],
+                    "resolved_attn_backend": self.loaded_attn_backend,
+                    "prewarm": payload.get("prewarm", False),
                 },
             }
             path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         else:
-            path.write_text(caption.strip() + "\n", encoding="utf-8")
+            path.write_text(caption + "\n", encoding="utf-8")
 
         return f"Saved to: {path}"
 
-    def _save_batch_caption(self, payload: dict, image_file: Path, caption: str, save_folder: Path) -> str:
-        path = self._batch_output_path(payload, image_file, save_folder)
+    def _batch_output_path(self, payload: dict[str, Any], image_path: Path, save_folder: Path) -> Path:
+        prefix = sanitize_filename(payload["batch_prefix"])
+        base = image_path.stem if not prefix else f"{prefix}_{image_path.stem}"
+        ext = ".json" if payload["save_format"] == "json" else ".txt"
+        return save_folder / f"{base}{ext}"
+
+    def _save_batch_output(self, payload: dict[str, Any], image_path: Path, caption: str, save_folder: Path):
+        path = self._batch_output_path(payload, image_path, save_folder)
+        path.parent.mkdir(parents=True, exist_ok=True)
 
         if path.suffix.lower() == ".json":
             data = {
-                "image_path": str(image_file),
+                "model_name": payload["model_name"],
+                "image_path": str(image_path),
+                "system_prompt": payload["system_prompt"],
+                "user_prompt": payload["user_prompt"],
+                "enable_thinking": payload["enable_thinking"],
+                "speed_preset": payload.get("speed_preset", DEFAULT_SPEED_PRESET),
                 "caption": caption,
                 "generation": {
                     "max_new_tokens": payload["max_new_tokens"],
+                    "max_image_side": payload["max_image_side"],
+                    "do_sample": payload["do_sample"],
                     "temperature": payload["temperature"],
                     "top_p": payload["top_p"],
                     "top_k": payload["top_k"],
                     "repetition_penalty": payload["repetition_penalty"],
-                    "do_sample": payload["do_sample"],
+                    "requested_attn_backend": payload["attn_backend"],
+                    "resolved_attn_backend": self.loaded_attn_backend,
+                    "prewarm": payload.get("prewarm", False),
                 },
             }
             path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         else:
-            path.write_text(caption.strip() + "\n", encoding="utf-8")
+            path.write_text(caption + "\n", encoding="utf-8")
 
-        return str(path)
+    # ---------- Finish / Error ----------
 
-    def _finish_success(self, result_text: str, status_text: str = "Caption generated successfully."):
-        self._reset_caption_timer()
-        self._set_output(result_text)
-        self._set_status(status_text, self.good)
+    def _finish_job(self, text: str, status: str, color: str):
+        self._stop_timer()
+        self._set_output(text)
+        self._set_status(status, color)
         self.generate_button.config(state="normal")
         self.stop_button.config(state="disabled")
-        self.current_worker = None
-        messagebox.showinfo("Done", status_text)
-
-    def _finish_stopped(self, result_text: str, status_text: str = "Captioning stopped."):
-        self._reset_caption_timer()
-        self._set_output(result_text)
-        self._set_status(status_text, self.accent2)
-        self.generate_button.config(state="normal")
-        self.stop_button.config(state="disabled")
-        self.current_worker = None
-        messagebox.showinfo("Stopped", status_text)
+        self.batch_progress_var.set("")
+        self.current_item_var.set("Current: done")
 
     def _finish_error(self, error_text: str):
-        self._reset_caption_timer()
+        self._stop_timer()
         self._set_output(f"Error:\n{error_text}")
-        self._set_status("Generation failed. Check the output for details.", self.error)
+        self._set_status("Generation failed. See logs and output for details.", self.bad)
         self.generate_button.config(state="normal")
         self.stop_button.config(state="disabled")
-        self.current_worker = None
-        messagebox.showerror("Generation error", error_text.splitlines()[0])
+        self.batch_progress_var.set("")
+        self.current_item_var.set("Current: error")
+        messagebox.showerror("Generation failed", error_text.splitlines()[0])
+
+    # ---------- Shutdown ----------
+
+    def on_close(self):
+        if self.worker and self.worker.is_alive():
+            if not messagebox.askyesno("Exit", "A job is still running. Stop it and exit?"):
+                return
+            self.stop_requested.set()
+        self.unload_model(silent=True)
+        self.root.destroy()
 
 
 def main():
-    root = tk.Tk()
-    app = CaptionGeneratorApp(root)
+    root_cls = TkinterDnD.Tk if TkinterDnD is not None else tk.Tk
+    root = root_cls()
+    app = QwenCaptionStudio(root)
     root.mainloop()
 
 
